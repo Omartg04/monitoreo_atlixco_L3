@@ -263,6 +263,50 @@ def avance_cuotas_global(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(filas)
 
 
+def composicion_lograda(df: pd.DataFrame,
+                        seccion: int | None = None) -> pd.DataFrame:
+    """
+    Composición demográfica REAL de lo levantado, sin referencia a metas.
+
+    Se usa en lugar de avance_cuotas mientras DISTRIBUCION_CUOTAS siga siendo
+    placeholder: comparar avance contra una meta inventada produce semáforos
+    que mienten, y un coordinador que ve rojo en una celda sale a perseguir una
+    cuota que nadie calibró. La composición lograda, en cambio, es un hecho
+    observado: sirve para detectar desequilibrios (todo hombres jóvenes, nadie
+    de 60+) sin afirmar cuál debería ser la proporción correcta.
+
+    Cuando las cuotas se calibren contra el marco muestral de Atlixco, se puede
+    volver a avance_cuotas / sesgo_cuotas, que ya están implementadas.
+    """
+    cols = ["rango_edad", "sexo", "n", "pct_logrado"]
+    d = df if seccion is None else df[df["seccion_electoral"] == seccion]
+    conteo = _conteo_cuotas(d)
+    total = int(conteo.sum()) if len(conteo) else 0
+
+    filas = []
+    for rango in ETIQUETAS_RANGO_EDAD:
+        for sexo in SEXOS_CUOTA:
+            n = int(conteo.get((rango, sexo), 0))
+            filas.append({
+                "rango_edad": rango, "sexo": sexo, "n": n,
+                "pct_logrado": round(100 * n / total, 1) if total else 0.0,
+            })
+    out = pd.DataFrame(filas)[cols]
+
+    # Registros terminados sin sexo o sin edad válida: no entran a ninguna
+    # celda, así que hay que reportarlos aparte o el total no cuadra.
+    if not d.empty:
+        t = d[d["terminada"]]
+        sin_clasificar = int(
+            (t["sexo_cuota"].isna() | t["rango_edad_cuota"].isna()).sum()
+        )
+    else:
+        sin_clasificar = 0
+    out.attrs["total_clasificados"] = total
+    out.attrs["sin_clasificar"] = sin_clasificar
+    return out
+
+
 def sesgo_cuotas(df: pd.DataFrame) -> pd.DataFrame:
     """
     Desviación de la composición LOGRADA respecto a la objetivo, en puntos

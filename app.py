@@ -20,6 +20,7 @@ from pathlib import Path
 
 import folium
 import pandas as pd
+from folium.plugins import Fullscreen
 import plotly.express as px
 import streamlit as st
 import streamlit_authenticator as stauth
@@ -33,8 +34,8 @@ from config import (
     ESTRATOS, SECCIONES_FUERA_MUESTRA, SECCIONES_RESECCIONADAS,
     GEOJSON_SECCIONES, ATLIXCO_CENTRO, ATLIXCO_ZOOM,
     PUNTOS_MUESTRA, PUNTOS_POR_SECCION, DIST_MANZANA_REFERENCIA_M,
-    CANDIDATOS, ATRIBUTOS_BLOQUE7, ETIQUETAS_ATRIBUTO, CANDIDATO_FOCO,
-    CUOTAS_GLOBALES, ETIQUETAS_RANGO_EDAD, SEXOS_CUOTA,
+    CANDIDATOS, CANDIDATO_FOCO,
+    ETIQUETAS_RANGO_EDAD,
     ROLES, MODO, INICIO_OPERATIVO, CRITERIO_TERMINADA, META_ENCUESTAS_DIARIAS,
     MAPAS_CAMPO,
 )
@@ -229,18 +230,6 @@ def color_duracion(v):
     return "background-color:#FFF3CD;color:#856404;font-weight:600"
 
 
-def color_desviacion(v):
-    """Para sesgo de cuotas: desviación en puntos porcentuales, signo indiferente."""
-    if pd.isna(v):
-        return ""
-    a = abs(v)
-    if a >= 10:
-        return "background-color:#F8D7DA;color:#721C24;font-weight:700"
-    if a >= 5:
-        return "background-color:#FFF3CD;color:#856404;font-weight:700"
-    return "background-color:#D4EDDA;color:#155724;font-weight:600"
-
-
 def tabla(df_in, estilos=None, formatos=None, altura=None, **kw):
     """
     st.dataframe con el estilo tipográfico del tablero.
@@ -316,34 +305,6 @@ def agregar_capas_base(mapa: folium.Map) -> None:
         show=False,
     ).add_to(mapa)
 
-
-def barra_pct(df_in, campo, titulo, orden=None, colores=None, altura=260):
-    """Barra horizontal de distribución porcentual de una variable categórica."""
-    if campo not in df_in.columns or df_in[campo].dropna().empty:
-        return None
-    cuenta = (df_in[campo].value_counts(normalize=True)
-              .mul(100).round(1).reset_index())
-    cuenta.columns = ["Respuesta", "Porcentaje"]
-    if orden:
-        cuenta["Respuesta"] = pd.Categorical(cuenta["Respuesta"],
-                                             categories=orden, ordered=True)
-        cuenta = cuenta.sort_values("Respuesta")
-    else:
-        cuenta = cuenta.sort_values("Porcentaje", ascending=True)
-
-    fig = px.bar(
-        cuenta, x="Porcentaje", y="Respuesta", orientation="h",
-        color="Respuesta",
-        color_discrete_sequence=colores or [VERDE_L, VERDE, AZUL_L, NARANJA,
-                                            ROJO, AMARILLO, "#aaa"],
-        text=cuenta["Porcentaje"].apply(lambda x: f"{x}%"),
-        title=titulo, height=altura,
-    )
-    fig.update_traces(textposition="outside")
-    fig.update_layout(plot_bgcolor="white", paper_bgcolor="white", showlegend=False,
-                      font_family="IBM Plex Sans",
-                      margin=dict(t=45, b=5, l=200), xaxis_range=[0, 105])
-    return fig
 
 
 def grafica(fig, **kw):
@@ -484,22 +445,19 @@ st.markdown(f"""
 # ══════════════════════════════════════════════════════════════════════════════
 # TABS
 # ══════════════════════════════════════════════════════════════════════════════
-if _rol == "estatal":
-    tab0, tab1, tab2, tab3, tab4 = st.tabs([
-        "🗂️  Planeación",
-        "📈  Avance vs Meta",
-        "🗺️  Mapa de Cobertura",
-        "🚩  Flags de Calidad y Sesgo",
-        "📊  Resultados del Instrumento",
-    ])
-else:
-    tab0, tab1, tab2, tab3 = st.tabs([
-        "🗂️  Planeación",
-        "📈  Avance vs Meta",
-        "🗺️  Mapa de Cobertura",
-        "🚩  Flags de Calidad y Sesgo",
-    ])
-    tab4 = None
+# El tablero NO expone tabulados del instrumento. Decidido 08/10/2026: sobre
+# base cruda y sin ponderar, una captura de pantalla de esos resultados circula
+# como si fueran definitivos, y la leyenda "preliminar" no sobrevive a un
+# screenshot. Los resultados sustantivos salen del pipeline de análisis, con
+# expansión aplicada, no de aquí.
+#
+# Al no haber tab restringido, ambos roles ven los mismos cuatro tabs.
+tab0, tab1, tab2, tab3 = st.tabs([
+    "🗂️  Planeación",
+    "📈  Avance vs Meta",
+    "🗺️  Mapa de Cobertura",
+    "🚩  Flags de Calidad y Sesgo",
+])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -560,10 +518,270 @@ with tab0:
                         ["Meta"])],
               formatos={"% del total": "{:.1f}%"})
 
-    # ── Carga por sección ─────────────────────────────────────────────────────
-    st.markdown('<div class="sec-title">Carga de trabajo por sección</div>',
+    # ── Secciones del recorrido ───────────────────────────────────────────────
+    # Filtro LOCAL a este tab, deliberadamente separado del sidebar: el sidebar
+    # filtra datos de avance (viene de Bubble), esto arma el despliegue del día
+    # (es planeación estática). Mezclarlos haría que enfocar el mapa cambiara
+    # los KPIs de avance sin pedirlo.
+    st.markdown('<div class="sec-title">Secciones de mi recorrido</div>',
                 unsafe_allow_html=True)
 
+    secciones_recorrido = st.multiselect(
+        "Selecciona las secciones que vas a cubrir — vacío muestra todas",
+        sorted(METAS_POR_SECCION.keys()),
+        default=[],
+        format_func=lambda s: (f"{s} · {METAS_POR_SECCION[s]['estrato']} · "
+                               f"{METAS_POR_SECCION[s]['manzanas']} mz · "
+                               f"meta {METAS_POR_SECCION[s]['meta_encuestas']}"),
+        key="secciones_recorrido",
+    )
+
+    # Vacío = todas. `hay_seleccion` distingue "ver el operativo completo" de
+    # "enfocar mi recorrido", que cambia el zoom y el mensaje compartible.
+    hay_seleccion = bool(secciones_recorrido)
+    secciones_foco = sorted(secciones_recorrido) if hay_seleccion \
+        else sorted(METAS_POR_SECCION.keys())
+
+    if hay_seleccion:
+        meta_foco = sum(METAS_POR_SECCION[s]["meta_encuestas"] for s in secciones_foco)
+        mz_foco = sum(METAS_POR_SECCION[s]["manzanas"] for s in secciones_foco)
+        st.success(
+            f"**Recorrido:** {len(secciones_foco)} secciones · {mz_foco} manzanas · "
+            f"{meta_foco} entrevistas objetivo  ·  "
+            f"secciones {', '.join(map(str, secciones_foco))}")
+
+    # ── Mapa de la muestra ────────────────────────────────────────────────────
+    st.markdown('<div class="sec-title">Mapa de la muestra</div>',
+                unsafe_allow_html=True)
+
+    if GEOJSON is None:
+        st.warning(f"No se encontró {GEOJSON_SECCIONES}. Colócalo junto a app.py.")
+    else:
+        geo_plan = copy.deepcopy(GEOJSON)
+        bounds_foco: list[list[float]] | None = None
+
+        for feature in geo_plan["features"]:
+            sec = feature["properties"].get("seccion")
+            info = METAS_POR_SECCION.get(sec)
+            en_foco = sec in secciones_foco
+            if info is None:
+                feature["properties"].update(
+                    {"estrato": "—", "meta": 0, "manzanas": 0,
+                     "estado": "Fuera de muestra"})
+            else:
+                feature["properties"].update(
+                    {"estrato": info["estrato"], "meta": info["meta_encuestas"],
+                     "manzanas": info["manzanas"],
+                     "estado": "En mi recorrido" if (hay_seleccion and en_foco)
+                               else "En muestra"})
+            # Bounds acumulados de las secciones enfocadas, para el fit_bounds
+            if hay_seleccion and en_foco:
+                b = bounds_de_geometria(feature["geometry"])
+                if b:
+                    bounds_foco = b if bounds_foco is None else [
+                        [min(bounds_foco[0][0], b[0][0]), min(bounds_foco[0][1], b[0][1])],
+                        [max(bounds_foco[1][0], b[1][0]), max(bounds_foco[1][1], b[1][1])],
+                    ]
+
+        def estilo_plan(feature):
+            props = feature["properties"]
+            sec = props.get("seccion")
+            fuera_muestra = props.get("estado") == "Fuera de muestra"
+
+            if fuera_muestra:
+                base = {"fillColor": "#CCCCCC", "color": "#999999",
+                        "weight": 0.6, "fillOpacity": 0.28}
+            else:
+                base = {"fillColor": ESTRATO_COLORES.get(props["estrato"], AZUL_L),
+                        "color": "#333", "weight": 1.2, "fillOpacity": 0.5}
+
+            if not hay_seleccion:
+                return base
+
+            if sec in secciones_foco:
+                # Contorno marcado para que salte entre las atenuadas
+                return {**base, "color": AZUL, "weight": 3.2, "fillOpacity": 0.72}
+
+            # Las no seleccionadas se atenúan pero NO se ocultan: sin ellas se
+            # pierde la referencia de qué hay alrededor y dónde está parado uno.
+            return {**base, "weight": 0.5, "fillOpacity": 0.12, "color": "#BBBBBB"}
+
+        mapa_plan = folium.Map(location=ATLIXCO_CENTRO, zoom_start=ATLIXCO_ZOOM,
+                               tiles=None)
+        agregar_capas_base(mapa_plan)
+
+        Fullscreen(
+            position="topleft",
+            title="Pantalla completa",
+            title_cancel="Salir de pantalla completa",
+            force_separate_button=True,
+        ).add_to(mapa_plan)
+
+        folium.GeoJson(
+            geo_plan, style_function=estilo_plan,
+            highlight_function=lambda f: {"fillOpacity": 0.85, "weight": 3},
+            tooltip=folium.GeoJsonTooltip(
+                fields=["seccion", "estrato", "estado", "manzanas", "meta"],
+                aliases=["Sección:", "Estrato:", "Estado:", "Manzanas:", "Meta:"],
+                localize=True, sticky=True,
+                style=("background-color:white;border:1px solid #2E7D5E;"
+                       "border-radius:6px;padding:8px 12px;"
+                       "font-family:'IBM Plex Sans',sans-serif;font-size:13px;"),
+            ),
+            name="Secciones electorales",
+        ).add_to(mapa_plan)
+
+        # Manzanas: las del recorrido en su capa propia y con marcador más
+        # grande; el resto queda como capa apagable para no competir.
+        puntos_foco = [p for p in PUNTOS_MUESTRA if p["seccion"] in secciones_foco]
+        puntos_resto = ([p for p in PUNTOS_MUESTRA if p["seccion"] not in secciones_foco]
+                        if hay_seleccion else [])
+
+        capa_foco = folium.FeatureGroup(
+            name="Manzanas de mi recorrido" if hay_seleccion
+            else "Manzanas seleccionadas", show=True)
+        for p in puntos_foco:
+            folium.CircleMarker(
+                location=[p["latitud"], p["longitud"]],
+                radius=6 if hay_seleccion else 4,
+                color="#FFFFFF", weight=1.4,
+                fill=True, fill_color=ESTRATO_COLORES.get(p["estrato"], AZUL),
+                fill_opacity=0.95,
+                tooltip=f"{p['punto_id']} · meta {p['meta_punto']}",
+                popup=(f"<b>{p['punto_id']}</b><br>Sección {p['seccion']}<br>"
+                       f"Localidad {p['localidad']} · Manzana {p['manzana']}<br>"
+                       f"Objetivo: {p['meta_punto']} entrevistas<br>"
+                       f"<a href='{p.get('google_maps_url', '')}' target='_blank'>"
+                       f"Abrir en Google Maps</a>"),
+            ).add_to(capa_foco)
+        capa_foco.add_to(mapa_plan)
+
+        if puntos_resto:
+            capa_resto = folium.FeatureGroup(name="Otras manzanas del operativo",
+                                             show=False)
+            for p in puntos_resto:
+                folium.CircleMarker(
+                    location=[p["latitud"], p["longitud"]], radius=3,
+                    color="#CCCCCC", weight=0.8, fill=True, fill_color="#BBBBBB",
+                    fill_opacity=0.5,
+                    tooltip=f"{p['punto_id']} · sección {p['seccion']}",
+                ).add_to(capa_resto)
+            capa_resto.add_to(mapa_plan)
+
+        folium.LayerControl(collapsed=False).add_to(mapa_plan)
+        if bounds_foco:
+            mapa_plan.fit_bounds(bounds_foco, padding=(25, 25))
+
+        st_folium(mapa_plan, use_container_width=True, height=620,
+                  returned_objects=[], key="mapa_planeacion")
+
+        if hay_seleccion:
+            st.caption(
+                "Mapa enfocado a tu recorrido · las secciones vecinas quedan "
+                "atenuadas para dar referencia sin competir · ⛶ arriba a la "
+                "izquierda abre pantalla completa · el control de capas cambia "
+                "a vista satelital.")
+        else:
+            st.caption(
+                "Polígonos coloreados por estrato · puntos = las 200 manzanas de "
+                "la muestra · gris = secciones fuera de muestra · ⛶ arriba a la "
+                "izquierda abre pantalla completa · el control de capas cambia a "
+                "vista satelital.")
+
+    # ── Enlaces de campo para compartir ───────────────────────────────────────
+    # El brigadista no entra al tablero: abre un link en su celular. El
+    # coordinador copia de aquí y manda por WhatsApp. El mensaje refleja la
+    # selección de arriba, así que el mismo control sirve para los dos casos:
+    # varias secciones = planeación del día; una sola = mensaje para el
+    # brigadista de esa sección.
+    st.markdown('<div class="sec-title">Mensaje para compartir</div>',
+                unsafe_allow_html=True)
+
+    # Un enlace por SECCIÓN, no por manzana: el mapa de My Maps ya trae las
+    # manzanas marcadas y el brigadista las explora ahí, con el contexto de la
+    # sección completa. Listar 4-13 URLs por sección era redundante y hacía el
+    # mensaje tres veces más largo.
+    #
+    # La lista de números de manzana SÍ se queda, sin URL: es una línea y
+    # funciona como checklist — si el mapa muestra 4 puntos y el mensaje dice
+    # "29, 32, 36, 51", el brigadista verifica que no se le saltó ninguno.
+    incluir_urls_manzana = st.checkbox(
+        "Incluir también el enlace de cada manzana",
+        value=False, key="incluir_urls_manzana",
+        help="Normalmente no hace falta: el mapa de la sección ya trae las "
+             "manzanas. Actívalo si algún brigadista necesita navegar punto "
+             "por punto desde el mensaje.",
+    )
+
+    lineas: list[str] = []
+    if hay_seleccion and len(secciones_foco) > 1:
+        meta_total = sum(METAS_POR_SECCION[s]["meta_encuestas"] for s in secciones_foco)
+        mz_total = sum(METAS_POR_SECCION[s]["manzanas"] for s in secciones_foco)
+        lineas += [
+            "📋 ATLIXCO · RECORRIDO DEL DÍA",
+            f"{len(secciones_foco)} secciones · {mz_total} manzanas · "
+            f"{meta_total} entrevistas objetivo",
+            "",
+        ]
+
+    for sec in secciones_foco:
+        info_sec = METAS_POR_SECCION[sec]
+        puntos_sec = PUNTOS_POR_SECCION.get(sec, [])
+        mapas_sec = [m for m in MAPAS_CAMPO
+                     if not m.get("secciones") or sec in m["secciones"]]
+
+        lineas += [
+            f"📍 SECCIÓN {sec} · {info_sec['estrato']}",
+            f"{info_sec['manzanas']} manzanas · "
+            f"meta {info_sec['meta_encuestas']} entrevistas",
+        ]
+
+        # Manzanas agrupadas por localidad. En secciones rurales una sección
+        # abarca varias localidades (la 208 tiene tres), y el número de manzana
+        # solo identifica el punto dentro de su localidad.
+        por_localidad: dict[int, list[int]] = {}
+        for p in puntos_sec:
+            por_localidad.setdefault(p["localidad"], []).append(p["manzana"])
+        varias_loc = len(por_localidad) > 1
+        for loc in sorted(por_localidad):
+            numeros = ", ".join(str(mz) for mz in sorted(por_localidad[loc]))
+            lineas.append(f"Manzanas (Loc {loc}): {numeros}" if varias_loc
+                          else f"Manzanas: {numeros}")
+
+        for m in mapas_sec:
+            lineas.append(f"🗺️ {m['url']}")
+
+        if incluir_urls_manzana:
+            lineas.append("Puntos:")
+            for p in sorted(puntos_sec, key=lambda x: (x["localidad"], x["manzana"])):
+                etiqueta = (f"Loc {p['localidad']} · Mz {p['manzana']}"
+                            if varias_loc else f"Mz {p['manzana']}")
+                lineas.append(f"• {etiqueta} → {p.get('google_maps_url', '')}")
+
+        if info_sec.get("observaciones"):
+            lineas.append(f"⚠️ {info_sec['observaciones']}")
+        lineas.append("")
+
+    mensaje = "\n".join(lineas).rstrip()
+
+    if not hay_seleccion:
+        st.info(
+            "Selecciona arriba las secciones de tu recorrido para generar el "
+            "mensaje. Con varias secciones sale la planeación del día; con una "
+            "sola, el mensaje que le mandas al brigadista de esa sección.")
+    else:
+        st.code(mensaje, language=None)
+        aviso_largo = ("" if len(mensaje) < 4096 else
+                       " ⚠️ Supera los 4,096 caracteres de un mensaje de "
+                       "WhatsApp: se partirá en varios. Selecciona menos "
+                       "secciones si quieres mandarlo en uno solo.")
+        st.caption(
+            f"Usa el botón de copiar (esquina superior derecha del bloque) y "
+            f"pégalo en WhatsApp. El enlace abre el mapa de la sección, donde "
+            f"el brigadista explora sus manzanas en contexto. "
+            f"{len(mensaje):,} caracteres.{aviso_largo}")
+
+    # ── Tabla de referencia ───────────────────────────────────────────────────
     df_plan = pd.DataFrame([
         {
             "Sección": s,
@@ -575,126 +793,22 @@ with tab0:
             "Observaciones": v.get("observaciones") or "",
         }
         for s, v in METAS_POR_SECCION.items()
-    ]).sort_values("Meta", ascending=False)
-
-    fig_sec = px.bar(
-        df_plan.sort_values("Meta"), x="Meta", y="Sección", orientation="h",
-        color="Estrato", color_discrete_map=ESTRATO_COLORES,
-        title="Entrevistas objetivo por sección electoral",
-        height=max(420, 17 * len(df_plan)),
-    )
-    fig_sec.update_layout(plot_bgcolor="white", paper_bgcolor="white",
-                          font_family="IBM Plex Sans", margin=dict(t=45, b=10),
-                          yaxis=dict(type="category"),
-                          legend=dict(orientation="h", y=-0.04))
-    st.plotly_chart(fig_sec, use_container_width=True)
+    ]).sort_values("Sección")
 
     with st.expander("Ver tabla de planeación por sección", expanded=False):
-        tabla(df_plan)
+        solo_recorrido = st.checkbox(
+            "Mostrar solo las secciones de mi recorrido",
+            value=hay_seleccion, disabled=not hay_seleccion,
+            key="tabla_solo_recorrido")
+        df_tabla = (df_plan[df_plan["Sección"].isin(secciones_foco)]
+                    if solo_recorrido and hay_seleccion else df_plan)
+        tabla(df_tabla, altura=min(80 + len(df_tabla) * 35, 520))
         st.caption(
             f"La sección 160 concentra {METAS_POR_SECCION[160]['meta_encuestas']} "
-            f"entrevestas en {METAS_POR_SECCION[160]['manzanas']} manzanas: fue "
+            f"entrevistas en {METAS_POR_SECCION[160]['manzanas']} manzanas: fue "
             f"reseccionada en 2026 (vigentes "
             f"{', '.join(map(str, SECCIONES_RESECCIONADAS[160]))}), pero campo "
-            f"captura 160 y el monitoreo usa su polígono anterior."
-            .replace("entrevestas", "entrevistas")
-        )
-
-    # ── Cuota objetivo ────────────────────────────────────────────────────────
-    st.markdown('<div class="sec-title">Cuota objetivo — sexo × rango de edad</div>',
-                unsafe_allow_html=True)
-
-    df_cuota_obj = pd.DataFrame([
-        {"rango_edad": r, "sexo": s, "meta": CUOTAS_GLOBALES[(r, s)]}
-        for r in ETIQUETAS_RANGO_EDAD for s in SEXOS_CUOTA
-    ])
-    c1, c2 = st.columns([2, 3])
-    with c1:
-        grafica(mapa_calor_cuotas(df_cuota_obj, "meta",
-                                  "Entrevistas objetivo por celda", "Blues"))
-    with c2:
-        st.markdown(
-            """Las cuotas por sección se derivan de una distribución única
-            (`DISTRIBUCION_CUOTAS` en `config.py`) repartida por el método de
-            mayores restos, de modo que las ocho celdas **siempre suman
-            exactamente la meta de cada sección**.
-
-            Recalibrar la cuota expost es cambiar ocho proporciones en un solo
-            lugar: las 45 secciones se recalculan solas y siguen cuadrando.""")
-        st.warning(
-            "Las proporciones actuales son **placeholder** — una estructura de "
-            "población adulta aproximada, no derivada del marco muestral de "
-            "Atlixco. Calibrar antes de usarlas como cuota operativa.")
-
-    # ── Enlaces de campo para compartir ───────────────────────────────────────
-    # El brigadista no entra al tablero: abre un link en su celular. El
-    # coordinador copia de aquí y manda por WhatsApp. Se usa st.code() porque
-    # trae botón de copiar integrado — un st.text_area obligaría a seleccionar
-    # a mano en el celular, que es donde esto se va a usar.
-    st.markdown('<div class="sec-title">Enlaces de campo para compartir</div>',
-                unsafe_allow_html=True)
-
-    seccion_enlace = st.selectbox(
-        "Sección a compartir", sorted(METAS_POR_SECCION.keys()),
-        format_func=lambda s: (f"{s} · {METAS_POR_SECCION[s]['estrato']} · "
-                               f"{METAS_POR_SECCION[s]['manzanas']} manzanas · "
-                               f"meta {METAS_POR_SECCION[s]['meta_encuestas']}"),
-        key="seccion_enlace_campo",
-    )
-
-    info_sec = METAS_POR_SECCION[seccion_enlace]
-    puntos_sec = PUNTOS_POR_SECCION.get(seccion_enlace, [])
-
-    # Mapas de Google Maps que cubren esta sección (lista vacía = todo el operativo)
-    mapas_aplicables = [
-        m for m in MAPAS_CAMPO
-        if not m.get("secciones") or seccion_enlace in m["secciones"]
-    ]
-
-    ec1, ec2 = st.columns([3, 2])
-
-    with ec1:
-        lineas = [
-            f"📍 ATLIXCO · SECCIÓN {seccion_enlace}",
-            f"Estrato: {info_sec['estrato']} · "
-            f"{info_sec['manzanas']} manzanas · meta {info_sec['meta_encuestas']} entrevistas",
-            "",
-        ]
-        for m in mapas_aplicables:
-            lineas += [f"🗺️ {m['etiqueta']}", m["url"], ""]
-
-        lineas.append("Manzanas asignadas (4 entrevistas cada una):")
-        for p in sorted(puntos_sec, key=lambda x: (x["localidad"], x["manzana"])):
-            lineas.append(f"• Loc {p['localidad']} · Mz {p['manzana']} → "
-                          f"{p.get('google_maps_url', '')}")
-        if info_sec.get("observaciones"):
-            lineas += ["", f"⚠️ {info_sec['observaciones']}"]
-
-        st.code("\n".join(lineas), language=None)
-        st.caption(
-            "Usa el botón de copiar (esquina superior derecha del bloque) y "
-            "pégalo en WhatsApp. Los enlaces por manzana abren Google Maps en "
-            "las coordenadas exactas del punto a visitar.")
-
-    with ec2:
-        if mapas_aplicables:
-            st.markdown("**Mapas que cubren esta sección**")
-            for m in mapas_aplicables:
-                alcance = ("todo el operativo" if not m.get("secciones")
-                           else f"{len(m['secciones'])} secciones")
-                st.markdown(f"- [{m['etiqueta']}]({m['url']}) · {alcance}")
-        else:
-            st.info(
-                "No hay mapas de Google Maps cargados todavía. Pégalos en "
-                "`MAPAS_CAMPO` (config.py) y aparecerán aquí junto a los "
-                "enlaces por manzana.\n\n"
-                "Mientras tanto, los enlaces por manzana ya son compartibles: "
-                "salen de la tabla maestra y abren el punto exacto.")
-
-        st.markdown("**Enlaces por manzana**")
-        st.caption(
-            f"{len(puntos_sec)} manzanas en esta sección · "
-            f"{sum(1 for p in puntos_sec if p.get('google_maps_url'))} con enlace")
+            f"captura 160 y el monitoreo usa su polígono anterior.")
 
     with st.expander("Ver todos los enlaces por manzana del operativo"):
         df_enlaces = pd.DataFrame([
@@ -716,73 +830,6 @@ with tab0:
             },
         )
 
-    # ── Mapa de planeación ────────────────────────────────────────────────────
-    st.markdown('<div class="sec-title">Mapa de la muestra</div>',
-                unsafe_allow_html=True)
-
-    if GEOJSON is None:
-        st.warning(f"No se encontró {GEOJSON_SECCIONES}. Colócalo junto a app.py.")
-    else:
-        geo_plan = copy.deepcopy(GEOJSON)
-        for feature in geo_plan["features"]:
-            sec = feature["properties"].get("seccion")
-            info = METAS_POR_SECCION.get(sec)
-            if info is None:
-                feature["properties"].update(
-                    {"estrato": "—", "meta": 0, "manzanas": 0,
-                     "estado": "Fuera de muestra"})
-            else:
-                feature["properties"].update(
-                    {"estrato": info["estrato"], "meta": info["meta_encuestas"],
-                     "manzanas": info["manzanas"], "estado": "En muestra"})
-
-        def estilo_plan(feature):
-            props = feature["properties"]
-            if props.get("estado") == "Fuera de muestra":
-                return {"fillColor": "#CCCCCC", "color": "#999999",
-                        "weight": 0.6, "fillOpacity": 0.3}
-            return {"fillColor": ESTRATO_COLORES.get(props["estrato"], AZUL_L),
-                    "color": "#333", "weight": 1.2, "fillOpacity": 0.5}
-
-        mapa_plan = folium.Map(location=ATLIXCO_CENTRO, zoom_start=ATLIXCO_ZOOM,
-                               tiles=None)
-        agregar_capas_base(mapa_plan)
-
-        folium.GeoJson(
-            geo_plan, style_function=estilo_plan,
-            highlight_function=lambda f: {"fillOpacity": 0.8, "weight": 2.5},
-            tooltip=folium.GeoJsonTooltip(
-                fields=["seccion", "estrato", "estado", "manzanas", "meta"],
-                aliases=["Sección:", "Estrato:", "Estado:", "Manzanas:", "Meta:"],
-                localize=True, sticky=True,
-                style=("background-color:white;border:1px solid #2E7D5E;"
-                       "border-radius:6px;padding:8px 12px;"
-                       "font-family:'IBM Plex Sans',sans-serif;font-size:13px;"),
-            ),
-            name="Secciones electorales",
-        ).add_to(mapa_plan)
-
-        capa_manzanas = folium.FeatureGroup(name="Manzanas seleccionadas", show=True)
-        for p in PUNTOS_MUESTRA:
-            folium.CircleMarker(
-                location=[p["latitud"], p["longitud"]], radius=4,
-                color="#FFFFFF", weight=1.2,
-                fill=True, fill_color=ESTRATO_COLORES.get(p["estrato"], AZUL),
-                fill_opacity=0.95,
-                tooltip=f"{p['punto_id']} · meta {p['meta_punto']}",
-                popup=(f"<b>{p['punto_id']}</b><br>Sección {p['seccion']}<br>"
-                       f"Localidad {p['localidad']} · Manzana {p['manzana']}<br>"
-                       f"Objetivo: {p['meta_punto']} entrevistas"),
-            ).add_to(capa_manzanas)
-        capa_manzanas.add_to(mapa_plan)
-
-        folium.LayerControl(collapsed=False).add_to(mapa_plan)
-        st_folium(mapa_plan, use_container_width=True, height=540, returned_objects=[],
-                  key="mapa_planeacion")
-        st.caption(
-            "Polígonos coloreados por estrato · puntos = las 200 manzanas de la "
-            "muestra · gris = secciones fuera de muestra. Usa el control de capas "
-            "para cambiar a vista satelital.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -919,45 +966,42 @@ with tab1:
             st.plotly_chart(fig_box, use_container_width=True)
 
         # ── Cuotas ────────────────────────────────────────────────────────────
-        st.markdown('<div class="sec-title">Cobertura de cuotas — sexo × edad</div>',
-                    unsafe_allow_html=True)
+        # ── Composición demográfica lograda ───────────────────────────────────
+        # Deliberadamente SIN meta ni semáforo. Las 8 proporciones de
+        # DISTRIBUCION_CUOTAS siguen sin calibrar contra el marco muestral de
+        # Atlixco: pintar rojo/verde contra una meta inventada haría que campo
+        # persiga una cuota que nadie validó. Esto reporta un hecho observado.
+        # Cuando se calibren, kpis.avance_cuotas y kpis.sesgo_cuotas ya están
+        # listas para volver a conectarse aquí.
+        st.markdown(
+            '<div class="sec-title">Composición demográfica de lo levantado</div>',
+            unsafe_allow_html=True)
 
-        if seccion_sel != "Todas":
-            cuotas = kpis.avance_cuotas(df, seccion_sel)
-        else:
-            cuotas = kpis.avance_cuotas_global(df)
+        comp = kpis.composicion_lograda(
+            df, None if seccion_sel == "Todas" else seccion_sel)
+        total_clas = comp.attrs.get("total_clasificados", 0)
+        sin_clas = comp.attrs.get("sin_clasificar", 0)
 
         q1, q2 = st.columns([2, 3])
         with q1:
-            grafica(mapa_calor_cuotas(cuotas, "pct", "% de cuota alcanzado", "RdYlGn"))
+            grafica(mapa_calor_cuotas(
+                comp, "n", "Entrevistas terminadas por celda", "Blues"))
         with q2:
-            tbl_q = cuotas[["rango_edad", "sexo", "meta", "avance", "pct",
-                            "faltan", "semaforo"]].copy()
-            tbl_q.columns = ["Rango de edad", "Sexo", "Meta", "Avance",
-                             "% Cuota", "Faltan", "Semáforo"]
-            tabla(tbl_q,
-                  estilos=[(color_pct, ["% Cuota"]),
-                           (color_semaforo, ["Semáforo"])],
-                  formatos={"% Cuota": "{:.1f}%"})
+            tbl_q = comp.copy()
+            tbl_q.columns = ["Rango de edad", "Sexo", "Entrevistas", "% del total"]
+            tabla(tbl_q, formatos={"% del total": "{:.1f}%"})
+            st.caption(
+                f"{total_clas:,} entrevistas terminadas clasificadas"
+                + (f" · {sin_clas:,} sin sexo o edad válida, fuera de la tabla"
+                   if sin_clas else ""))
 
-        st.markdown(
-            '<div class="sec-title">Sesgo de composición (no de avance)</div>',
-            unsafe_allow_html=True)
-        sesgo = kpis.sesgo_cuotas(df)
-        tbl_sesgo = sesgo[["rango_edad", "sexo", "pct_objetivo", "pct_logrado",
-                           "desviacion_pp", "faltan"]].copy()
-        tbl_sesgo.columns = ["Rango de edad", "Sexo", "% objetivo", "% logrado",
-                             "Desviación (pp)", "Faltan"]
-        tabla(tbl_sesgo,
-              estilos=[(color_desviacion, ["Desviación (pp)"])],
-              formatos={"% objetivo": "{:.1f}%", "% logrado": "{:.1f}%",
-                        "Desviación (pp)": "{:+.1f}"})
-        st.caption(
-            "Compara la composición **lograda** contra la **objetivo**, "
-            "independientemente del avance. Una cuota al 50% pareja en las ocho "
-            "celdas no tiene sesgo; una al 90% en jóvenes y 10% en adultos "
-            "mayores tiene el mismo avance global y un sesgo que hay que "
-            "corregir mientras aún se puede. 🔴 ≥10 pp · 🟡 5–10 pp")
+        st.info(
+            "Se muestra la composición **lograda**, sin comparación contra "
+            "cuota: las proporciones objetivo todavía no se calibran contra el "
+            "marco muestral de Atlixco, y un semáforo sobre metas provisionales "
+            "llevaría a campo a perseguir un número que nadie validó. Sirve "
+            "igual para detectar desequilibrios — si una celda se queda muy "
+            "atrás frente a las demás, se corrige mientras aún se puede.")
 
         # ── Manzanas sin cobertura ────────────────────────────────────────────
         st.markdown('<div class="sec-title">Manzanas sin cobertura</div>',
@@ -1367,158 +1411,3 @@ with tab3:
             st.caption(
                 "🔴 sin ningún avance habiendo avance en otras secciones · "
                 "🟡 por debajo de la mitad del promedio global.")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 4 — RESULTADOS DEL INSTRUMENTO  (solo rol estatal)
-# ══════════════════════════════════════════════════════════════════════════════
-if tab4 is not None:
-    with tab4:
-        df_res = df[df["terminada"]] if not df.empty else df
-
-        if df_res.empty:
-            st.info("Sin encuestas terminadas para los filtros seleccionados.")
-        else:
-            st.caption(
-                f"Tabulados sobre **{len(df_res):,} encuestas terminadas**. "
-                f"Resultados preliminares sin ponderar — no usar para difusión.")
-
-            # ── Perfil sociodemográfico ───────────────────────────────────────
-            st.markdown('<div class="sec-title">Perfil sociodemográfico</div>',
-                        unsafe_allow_html=True)
-            s1, s2, s3 = st.columns(3)
-            with s1:
-                grafica(barra_pct(df_res, "sexo", "Sexo"))
-            with s2:
-                grafica(barra_pct(df_res, "rango_edad_cuota", "Rango de edad",
-                                  orden=ETIQUETAS_RANGO_EDAD))
-            with s3:
-                grafica(barra_pct(df_res, "ine", "¿Cuenta con INE?",
-                                  orden=["Sí", "No"], colores=[VERDE, "#ccc"]))
-
-            # Pirámide de edades
-            df_pir = df_res.dropna(subset=["edad", "sexo_cuota"]).copy()
-            if len(df_pir):
-                df_pir["grupo"] = df_pir["rango_edad_cuota"]
-                pir = (df_pir.groupby(["grupo", "sexo_cuota"], observed=True)
-                       .size().reset_index(name="n"))
-                pir.loc[pir["sexo_cuota"] == "H", "n"] *= -1
-                if not pir.empty:
-                    maximo = int(pir["n"].abs().max())
-                    paso = max(maximo // 4, 1)
-                    pos = list(range(0, maximo + paso, paso))
-                    ticks = [-t for t in reversed(pos[1:])] + pos
-                    fig_p = px.bar(
-                        pir, x="n", y="grupo", color="sexo_cuota", orientation="h",
-                        color_discrete_map={"H": AZUL_L, "M": NARANJA},
-                        category_orders={"grupo": ETIQUETAS_RANGO_EDAD},
-                        labels={"n": "Entrevistas", "grupo": "", "sexo_cuota": ""},
-                        title="Pirámide de edades (H izquierda · M derecha)",
-                        height=300)
-                    fig_p.update_xaxes(tickvals=ticks,
-                                       ticktext=[abs(t) for t in ticks])
-                    fig_p.update_layout(plot_bgcolor="white", paper_bgcolor="white",
-                                        font_family="IBM Plex Sans",
-                                        margin=dict(t=45, b=10))
-                    st.plotly_chart(fig_p, use_container_width=True)
-
-            st.markdown("---")
-
-            # ── Identificación partidaria e intención de voto ─────────────────
-            st.markdown(
-                '<div class="sec-title">Afinidad partidista e intención de voto</div>',
-                unsafe_allow_html=True)
-            v1, v2 = st.columns(2)
-            with v1:
-                grafica(barra_pct(df_res, "identificacion_partidaria",
-                                  "P4. Identificación partidista", altura=300))
-            with v2:
-                grafica(barra_pct(df_res, "intencion_voto_principal",
-                                  "P5. Intención de voto", altura=300))
-
-            st.markdown("---")
-
-            # ── Conocimiento y opinión ────────────────────────────────────────
-            st.markdown(
-                '<div class="sec-title">Conocimiento y opinión de aspirantes</div>',
-                unsafe_allow_html=True)
-
-            filas_conoce = []
-            for clave, nombre in CANDIDATOS.items():
-                col = f"conocimiento_{clave}"
-                if col in df_res.columns:
-                    sub = df_res[col].dropna()
-                    if len(sub):
-                        pct = round(
-                            sub.astype(str).str.strip().str.lower()
-                            .isin(["sí", "si"]).mean() * 100, 1)
-                        filas_conoce.append({"Aspirante": nombre,
-                                             "% lo conoce": pct})
-
-            k1, k2 = st.columns(2)
-            with k1:
-                if filas_conoce:
-                    df_conoce = pd.DataFrame(filas_conoce).sort_values("% lo conoce")
-                    fig_k = px.bar(
-                        df_conoce, x="% lo conoce", y="Aspirante", orientation="h",
-                        text=df_conoce["% lo conoce"].apply(lambda v: f"{v}%"),
-                        color_discrete_sequence=[VERDE_L],
-                        title="% que conoce a cada aspirante", height=330)
-                    fig_k.update_traces(textposition="outside")
-                    fig_k.update_layout(plot_bgcolor="white", paper_bgcolor="white",
-                                        showlegend=False,
-                                        font_family="IBM Plex Sans",
-                                        margin=dict(t=45, b=5, l=170),
-                                        xaxis_range=[0, 105])
-                    st.plotly_chart(fig_k, use_container_width=True)
-                else:
-                    st.info("Sin datos de conocimiento todavía.")
-            with k2:
-                sel = st.selectbox(
-                    "Aspirante — detalle", list(CANDIDATOS.items()),
-                    format_func=lambda kv: kv[1], key="aspirante_sel")
-                clave_sel, nombre_sel = sel
-                grafica(barra_pct(
-                    df_res, f"opinion_{clave_sel}",
-                    f"Opinión sobre {nombre_sel}",
-                    orden=["Buena", "Regular", "Mala"],
-                    colores=[VERDE, AMARILLO, ROJO], altura=330))
-                st.caption(
-                    "La opinión solo se pregunta a quien declaró conocer al "
-                    "aspirante — la base es menor que el total de entrevistas.")
-
-            # ── Atributos ─────────────────────────────────────────────────────
-            st.markdown(f"**Evaluación de atributos — {nombre_sel}**")
-            columnas_atrib = st.columns(3)
-            for i, atributo in enumerate(ATRIBUTOS_BLOQUE7):
-                campo = f"{atributo}_{clave_sel}"
-                with columnas_atrib[i % 3]:
-                    grafica(barra_pct(
-                        df_res, campo,
-                        ETIQUETAS_ATRIBUTO.get(atributo,
-                                               atributo.replace("_", " ").title()),
-                        altura=215))
-            st.caption(
-                "Los atributos se preguntan solo a quien conoce al aspirante; "
-                "«Es buen(a) candidato(a)» además solo a quien dio opinión "
-                "«Buena», así que su base es la más reducida de todas.")
-
-            st.markdown("---")
-
-            # ── Preferencia MORENA ────────────────────────────────────────────
-            st.markdown(
-                '<div class="sec-title">Preferencia de candidatura por MORENA</div>',
-                unsafe_allow_html=True)
-            grafica(barra_pct(df_res, "preferencia_total_morena",
-                              "P19.1 Preferencia total", altura=330))
-
-            with st.expander("Cruce de preferencia por sexo y rango de edad"):
-                if "preferencia_total_morena" in df_res.columns:
-                    cruce = pd.crosstab(
-                        df_res["preferencia_total_morena"],
-                        [df_res["sexo_cuota"], df_res["rango_edad_cuota"]],
-                        normalize="columns", dropna=False).mul(100).round(1)
-                    st.dataframe(cruce, use_container_width=True)
-                    st.caption(
-                        "Porcentajes por columna. Bases pequeñas por celda en "
-                        "etapas tempranas del operativo — interpretar con cautela.")
