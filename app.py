@@ -633,6 +633,21 @@ with tab0:
         geo_plan = copy.deepcopy(GEOJSON)
         bounds_foco: list[list[float]] | None = None
 
+        # Las secciones que el filtro de cobertura excluye NO se dibujan: el
+        # interruptor dice "apágalas", y atenuarlas las dejaba visibles y
+        # además se iluminaban al pasar el cursor.
+        #
+        # La distinción con el multiselect es deliberada: una sección ocultada
+        # por el filtro es trabajo cerrado y desaparece; una sección disponible
+        # que hoy no está en tu recorrido se atenúa, porque sigue pendiente y
+        # conviene verla alrededor.
+        ocultas = {s for s in METAS_POR_SECCION if s not in opciones_secciones}
+        if ocultas:
+            geo_plan["features"] = [
+                f for f in geo_plan["features"]
+                if f["properties"].get("seccion") not in ocultas
+            ]
+
         for feature in geo_plan["features"]:
             sec = feature["properties"].get("seccion")
             info = METAS_POR_SECCION.get(sec)
@@ -702,7 +717,11 @@ with tab0:
 
         folium.GeoJson(
             geo_plan, style_function=estilo_plan,
-            highlight_function=lambda f: {"fillOpacity": 0.85, "weight": 3},
+            # Solo se ilumina lo que está en foco: resaltar una sección
+            # atenuada al pasar el cursor la devolvía a primer plano.
+            highlight_function=lambda f: (
+                {"fillOpacity": 0.85, "weight": 3}
+                if f["properties"].get("seccion") in secciones_foco else {}),
             tooltip=folium.GeoJsonTooltip(
                 fields=["seccion", "estrato", "estado", "avance", "manzanas"],
                 aliases=["Sección:", "Estrato:", "Estado:", "Avance:",
@@ -718,7 +737,11 @@ with tab0:
         # Manzanas: las del recorrido en su capa propia y con marcador más
         # grande; el resto queda como capa apagable para no competir.
         puntos_foco = [p for p in PUNTOS_MUESTRA if p["seccion"] in secciones_foco]
-        puntos_resto = ([p for p in PUNTOS_MUESTRA if p["seccion"] not in secciones_foco]
+        # Las manzanas de secciones ocultas desaparecen con ellas; las de
+        # secciones disponibles fuera del recorrido quedan en capa apagable.
+        puntos_resto = ([p for p in PUNTOS_MUESTRA
+                         if p["seccion"] not in secciones_foco
+                         and p["seccion"] not in ocultas]
                         if hay_enfoque else [])
 
         capa_foco = folium.FeatureGroup(
