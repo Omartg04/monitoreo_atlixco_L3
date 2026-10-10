@@ -70,7 +70,16 @@ FECHAS_EXCLUIDAS = {
     "2026-10-08",                        # jueves — capacitación de encuestadores
 }
 
-# En MODO="test" se ignoran ambos cortes para poder ver las capturas de armado.
+# Hora de arranque de la jornada, hora local de Ciudad de México. Las capturas
+# anteriores a esta hora se descartan: el día 1 hubo un registro a las 08:43,
+# antes de que el operativo empezara. Es un corte de regla, no caso por caso,
+# para que no vuelva a requerir intervención manual.
+#
+# None desactiva el corte. No hay corte por hora de cierre: una entrevista que
+# se alarga al anochecer es legítima, y para eso está flag_horario_atipico.
+HORA_INICIO_JORNADA = 9
+
+# En MODO="test" se ignoran los cortes para poder ver las capturas de armado.
 APLICAR_CORTE_FECHA = (MODO == "produccion")
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -469,21 +478,51 @@ SESGO_ENC_DESVIO_ROJO     = 2.5
 
 # — Criterio de "encuesta terminada" —
 # Bubble no expone ningún campo de estatus (confirmado 07/10/2026), así que
-# hay que derivarlo. Dos criterios posibles:
+# hay que derivarlo de la última pregunta que el entrevistado alcanzó.
 #
-#   "pregunta_final"  La encuesta llegó a P19_1 (preferencia MORENA), que es
-#                     la última pregunta sustantiva del instrumento: pantalla
-#                     15 de 17, solo seguida de la despedida. Si está
-#                     contestada, el cuestionario se recorrió completo.
-#   "duracion"        duracion_min >= DUR_MIN_TERMINADA. Es el criterio que se
-#                     usó en L2, por falta de algo mejor. Es más débil: la
-#                     duración sale de Modified − Created, y cualquier edición
-#                     posterior del registro la infla retroactivamente.
+# ⚠️  ATENCIÓN AL ORDEN DEL CUESTIONARIO. En la v1 (9 oct) la última pregunta
+#     sustantiva era P19_1 (preferencia MORENA, pantalla 15 de 16). La v2 que
+#     arranca el 10 de octubre MOVIÓ P19_1 a la pantalla 8, y la última
+#     sustantiva pasó a ser P16 (votaría / nunca votaría, pantalla 15).
+#     Mantener el criterio en P19_1 contaría como terminadas encuestas
+#     abandonadas a mitad del cuestionario, inflando el avance en silencio.
 #
-# Se usa "pregunta_final" por defecto: mide completitud real en vez de tiempo
-# transcurrido. ⚠️ CONFIRMAR con campo que P19_1 no es salteable.
-CRITERIO_TERMINADA = "pregunta_final"    # "pregunta_final" | "duracion"
+# Criterios disponibles:
+#   "por_version"     RECOMENDADO. Cada registro se evalúa con la última
+#                     pregunta de SU versión del cuestionario, según
+#                     VERSIONES_CUESTIONARIO. Así el día 1 se mide con P19_1 y
+#                     el día 2 en adelante con P16, sin tocar nada cuando el
+#                     orden vuelva a cambiar.
+#   "p16"             llegó a P16 — hay valor en al menos uno de los 7 campos
+#                     codigo_votar_o_no_<aspirante>. P16 se pregunta a TODOS
+#                     los entrevistados, sin filtro (confirmado 09/10/2026).
+#   "pregunta_final"  llegó a P19_1. Válido SOLO para la v1 del cuestionario.
+#   "duracion"        duracion_min >= DUR_MIN_TERMINADA. El parche de L2, el
+#                     más débil: la duración sale de Modified − Created y
+#                     cualquier edición posterior del registro la infla.
+#
+# Al evaluar P16 cuentan TAMBIÉN los códigos 98/99: un "No sabe" en esa
+# pantalla significa que el entrevistado SÍ llegó ahí, y para medir
+# completitud importa haber recorrido la pantalla, no haber dado respuesta
+# sustantiva. Es el único lugar del sistema donde 97/98/99 son señal positiva.
+CRITERIO_TERMINADA = "por_version"
 DUR_MIN_TERMINADA  = 1.0                 # minutos, solo si CRITERIO = "duracion"
+
+# ── Versiones del cuestionario ────────────────────────────────────────────────
+# El orden de las pantallas cambió el 10 de octubre. P19_1 pasó de la pantalla
+# 15 a la 8, y P15 de la 13 a la 10. Consecuencia analítica: en la v1 el
+# entrevistado elegía su preferencia MORENA DESPUÉS de evaluar a 7 aspirantes
+# en 6 atributos; en la v2 la elige tras sólo la pregunta de conocimiento. El
+# contexto cognitivo de esa respuesta es distinto, así que P19_1 NO es
+# estrictamente comparable entre versiones y el análisis debe poder separarlas.
+VERSIONES_CUESTIONARIO = {
+    "v1": {"desde": "2026-10-09", "hasta": "2026-10-09",
+           "ultima_pregunta": "P19_1",
+           "nota": "P19_1 en pantalla 15 (última sustantiva)"},
+    "v2": {"desde": "2026-10-10", "hasta": None,
+           "ultima_pregunta": "P16",
+           "nota": "P19_1 movida a pantalla 8; P16 es la última sustantiva"},
+}
 
 # — Meta diaria por encuestador —
 META_ENCUESTAS_DIARIAS = 20   # TODO: confirmar con coordinación de campo
@@ -706,6 +745,85 @@ def _cargar_puntos_muestra(nombre: str = ARCHIVO_PUNTOS) -> list[dict]:
 
 
 PUNTOS_MUESTRA = _cargar_puntos_muestra()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CORRECCIONES DE SECCIÓN — INCIDENTE DEL DÍA 1
+# ══════════════════════════════════════════════════════════════════════════════
+# El 9 de octubre el catálogo de secciones del formulario estaba incompleto y
+# el campo era obligatorio, así que la instrucción a campo fue declarar una
+# sección sustituta aunque se trabajara otra. El catálogo se corrigió esa misma
+# noche, así que esto afecta ÚNICAMENTE a los registros del 9 de octubre.
+#
+# Cada corrección se resolvió con una de estas fuentes, en orden de precedencia:
+#   R1  GPS y sección declarada coinciden (ambas dentro del marco)
+#   R2  GPS coincide con la manzana de muestra más cercana — dos señales
+#       independientes
+#   R3  la declarada coincide con la manzana y el punto está a menos de 15 m
+#       del borde del polígono: ahí el GPS es el que cruzó el límite, no la
+#       declaración. Los límites seccionales corren por el eje de las calles,
+#       donde están las viviendas, así que caer junto al borde es lo normal
+#   R4  el GPS cae en una sección fuera del marco → se usa la manzana
+#   Omar / equipo: resolución documentada por coordinación, para los registros
+#       sin GPS y los genuinamente ambiguos
+#
+# El archivo es el registro de auditoría: folio, sección declarada, sección
+# corregida y la fuente de cada decisión. NO se sobrescribe el dato original —
+# la transformación conserva `seccion_declarada` junto a la corregida.
+ARCHIVO_CORRECCIONES_SECCION = "correcciones_seccion_dia1.csv"
+
+
+def _cargar_correcciones_seccion(nombre: str = ARCHIVO_CORRECCIONES_SECCION) -> dict:
+    """{folio: (seccion_corregida, fuente)}. Vacío si no existe el archivo."""
+    ruta = _BASE_DIR / nombre
+    if not ruta.exists():
+        logger.info("Sin archivo de correcciones de sección (%s) — se usa la "
+                    "sección declarada tal cual.", nombre)
+        return {}
+    correcciones: dict[str, tuple[int, str]] = {}
+    with open(ruta, encoding="utf-8", newline="") as f:
+        for fila in csv.DictReader(f):
+            try:
+                correcciones[fila["folio"]] = (int(fila["seccion_corregida"]),
+                                               fila.get("fuente", ""))
+            except (KeyError, TypeError, ValueError):
+                logger.warning("Fila de corrección ilegible: %s", fila)
+    return correcciones
+
+
+CORRECCIONES_SECCION = _cargar_correcciones_seccion()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# REGISTROS EXCLUIDOS DEL OPERATIVO
+# ══════════════════════════════════════════════════════════════════════════════
+# Encuestas que no cuentan para ninguna meta, descartadas una por una con
+# autorización explícita: capturas previas al arranque real de la jornada,
+# pruebas que se colaron, registros invalidados en auditoría.
+#
+# Se descartan por archivo y no borrando en Bubble: así queda constancia de
+# QUÉ se excluyó, POR QUÉ y QUIÉN lo autorizó. Un registro borrado en origen
+# no se puede auditar después.
+#
+# El corte por fecha (INICIO_OPERATIVO / FECHAS_EXCLUIDAS) sigue operando
+# aparte: esto es para casos individuales dentro de un día válido.
+ARCHIVO_REGISTROS_EXCLUIDOS = "registros_excluidos.csv"
+
+
+def _cargar_registros_excluidos(nombre: str = ARCHIVO_REGISTROS_EXCLUIDOS) -> dict:
+    """{folio: motivo}. Vacío si no existe el archivo."""
+    ruta = _BASE_DIR / nombre
+    if not ruta.exists():
+        return {}
+    excluidos: dict[str, str] = {}
+    with open(ruta, encoding="utf-8", newline="") as f:
+        for fila in csv.DictReader(f):
+            folio = (fila.get("folio") or "").strip()
+            if folio:
+                excluidos[folio] = fila.get("motivo", "sin motivo registrado")
+    return excluidos
+
+
+REGISTROS_EXCLUIDOS = _cargar_registros_excluidos()
 
 # Índice sección → puntos, para el flag de distancia y el mapa de planeación.
 PUNTOS_POR_SECCION: dict[int, list[dict]] = {}

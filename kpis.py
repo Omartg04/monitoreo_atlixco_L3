@@ -20,6 +20,7 @@ from __future__ import annotations
 import pandas as pd
 
 from config import (
+    GRABACION_DURACION_MIN_SEG,
     META_GLOBAL, METAS_POR_SECCION, META_POR_ESTRATO, SECCIONES_POR_ESTRATO,
     PUNTOS_MUESTRA, PUNTOS_POR_SECCION,
     ETIQUETAS_RANGO_EDAD, SEXOS_CUOTA, CUOTAS_GLOBALES, cuotas_de_seccion,
@@ -390,3 +391,100 @@ def manzanas_sin_cobertura(df: pd.DataFrame) -> pd.DataFrame:
     """Solo las manzanas de la muestra sin ninguna encuesta terminada."""
     cob = cobertura_manzanas(df)
     return cob[cob["avance"] == 0].reset_index(drop=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# KPI 7 · GRABACIONES DE AUDIO (P19_1)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def resumen_grabaciones(df: pd.DataFrame) -> dict:
+    """
+    Cobertura y calidad de las grabaciones de la pregunta P19_1.
+
+    Desde la v2 del cuestionario P19_1 está en la pantalla 8 de 16, no al
+    final. Eso cambia la lectura: un registro puede tener audio y NO estar
+    terminado, algo imposible en la v1. Esa combinación mide abandono entre
+    las pantallas 8 y 15, que es información nueva.
+    """
+    if df.empty:
+        return {"terminadas": 0, "con_audio": 0, "pct_cobertura": 0.0,
+                "sin_audio": 0, "audio_corto": 0, "minutos_totales": 0.0,
+                "duracion_mediana_seg": 0.0, "audio_sin_terminar": 0}
+
+    terminadas = df[df["terminada"]]
+    tiene = df["tiene_grabacion"].fillna(False)
+    dur = pd.to_numeric(df["grabacion_duracion_seg"], errors="coerce")
+
+    con_audio = int((terminadas["tiene_grabacion"].fillna(False)).sum())
+    n_term = len(terminadas)
+    dur_term = pd.to_numeric(terminadas["grabacion_duracion_seg"], errors="coerce")
+
+    return {
+        "terminadas": n_term,
+        "con_audio": con_audio,
+        "pct_cobertura": round(100 * con_audio / n_term, 1) if n_term else 0.0,
+        "sin_audio": n_term - con_audio,
+        "audio_corto": int((dur_term < GRABACION_DURACION_MIN_SEG).sum()),
+        "minutos_totales": round(float(dur[tiene].sum()) / 60, 1),
+        "duracion_mediana_seg": round(float(dur_term.median()), 1)
+                                if dur_term.notna().any() else 0.0,
+        # Audio presente en encuestas NO terminadas: solo posible desde la v2,
+        # donde P19_1 va antes que el bloque de atributos.
+        "audio_sin_terminar": int((tiene & ~df["terminada"].fillna(False)).sum()),
+    }
+
+
+def grabaciones_por_encuestador(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Tasa de grabación y duración por encuestador.
+
+    Una tasa baja concentrada en una persona suele ser un permiso de micrófono
+    denegado en su dispositivo, no desempeño: conviene revisarlo con ella antes
+    de tratarlo como incumplimiento.
+    """
+    cols = ["encuestador_nombre", "terminadas", "con_audio", "pct_audio",
+            "duracion_mediana_seg", "audio_corto"]
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+
+    d = df[df["terminada"]].copy()
+    if d.empty:
+        return pd.DataFrame(columns=cols)
+
+    d["_dur"] = pd.to_numeric(d["grabacion_duracion_seg"], errors="coerce")
+    d["_tiene"] = d["tiene_grabacion"].fillna(False)
+
+    g = d.groupby("encuestador_nombre", dropna=False).agg(
+        terminadas=("folio", "count"),
+        con_audio=("_tiene", "sum"),
+        duracion_mediana_seg=("_dur", "median"),
+        audio_corto=("_dur", lambda s: int((s < GRABACION_DURACION_MIN_SEG).sum())),
+    ).reset_index()
+
+    g["con_audio"] = g["con_audio"].astype(int)
+    g["pct_audio"] = (100 * g["con_audio"] / g["terminadas"].clip(lower=1)).round(1)
+    g["duracion_mediana_seg"] = g["duracion_mediana_seg"].round(1)
+    return g[cols].sort_values("pct_audio").reset_index(drop=True)
+
+
+def grabaciones_pendientes(df: pd.DataFrame) -> pd.DataFrame:
+    """Encuestas terminadas sin audio o con audio demasiado corto."""
+    cols = ["folio", "fecha", "encuestador_nombre", "seccion_electoral",
+            "grabacion_duracion_seg", "motivo", "grabacion_url"]
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+
+    d = df[df["terminada"]].copy()
+    d["_dur"] = pd.to_numeric(d["grabacion_duracion_seg"], errors="coerce")
+    d["_tiene"] = d["tiene_grabacion"].fillna(False)
+
+    sin = ~d["_tiene"]
+    corto = d["_tiene"] & (d["_dur"] < GRABACION_DURACION_MIN_SEG)
+    d = d[sin | corto].copy()
+    if d.empty:
+        return pd.DataFrame(columns=cols)
+
+    d["motivo"] = "sin grabación"
+    d.loc[corto, "motivo"] = (
+        d.loc[corto, "_dur"].apply(lambda s: f"audio de {s:.0f} s"))
+    return d[cols].sort_values(["fecha", "encuestador_nombre"]).reset_index(drop=True)

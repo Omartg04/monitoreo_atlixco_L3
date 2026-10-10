@@ -29,6 +29,8 @@ base_auditada*.csv
 # Excepción: los insumos de configuración SÍ se versionan — config.py depende
 # de puntos_muestra_L3.csv en tiempo de carga.
 !puntos_muestra_L3.csv
+!correcciones_seccion_dia1.csv
+!registros_excluidos.csv
 
 # ── Audio de las grabaciones ────────────────────────────────────────────────
 *.mp3

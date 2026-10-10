@@ -48,7 +48,8 @@ import streamlit as st
 from bubble_connector import descargar_crudo, carga_degradada
 from config import (
     FIELD_MAP, CACHE_TTL_SEC, CRITERIO_TERMINADA, DUR_MIN_TERMINADA,
-    INICIO_OPERATIVO, FECHAS_EXCLUIDAS, APLICAR_CORTE_FECHA,
+    VERSIONES_CUESTIONARIO, CORRECCIONES_SECCION, REGISTROS_EXCLUIDOS,
+    INICIO_OPERATIVO, FECHAS_EXCLUIDAS, APLICAR_CORTE_FECHA, HORA_INICIO_JORNADA,
     METAS_POR_SECCION, PUNTOS_POR_SECCION, RANGOS_EDAD,
     CANDIDATOS, ATRIBUTOS_BLOQUE7,
 )
@@ -129,6 +130,37 @@ def _columnas_codigo() -> list[str]:
     return [v for v in FIELD_MAP.values() if v.startswith("codigo_")]
 
 
+def _llego_al_final(d: pd.DataFrame, ultima_pregunta: str) -> pd.Series:
+    """
+    ¿El entrevistado alcanzó `ultima_pregunta`? Es la base de `terminada`.
+
+    Cuentan TAMBIÉN los códigos 97/98/99: un "No sabe" en la última pantalla
+    significa que el entrevistado SÍ llegó ahí, y lo que mide completitud es
+    haber recorrido la pantalla, no haber dado respuesta sustantiva. Es el
+    único lugar del sistema donde la no-respuesta es señal positiva — en todo
+    lo demás (promedios, straightlining) 97/98/99 se excluyen.
+    """
+    if ultima_pregunta == "P16":
+        # Batería de 7 aspirantes, sin filtro: se pregunta a todos.
+        cols = [f"codigo_votar_o_no_{cand}" for cand in CANDIDATOS
+                if f"codigo_votar_o_no_{cand}" in d.columns]
+        if not cols:
+            logger.warning("No hay columnas de P16 — 'terminada' en False.")
+            return pd.Series(False, index=d.index)
+        return d[cols].notna().any(axis=1)
+
+    if ultima_pregunta == "P19_1":
+        if "preferencia_total_morena" not in d.columns:
+            logger.warning("No hay columna de P19_1 — 'terminada' en False.")
+            return pd.Series(False, index=d.index)
+        return (d["preferencia_total_morena"].notna()
+                & (d["preferencia_total_morena"].astype(str).str.strip() != ""))
+
+    logger.warning("Última pregunta '%s' no reconocida — 'terminada' en False.",
+                   ultima_pregunta)
+    return pd.Series(False, index=d.index)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # TRANSFORMACIÓN
 # ══════════════════════════════════════════════════════════════════════════════
@@ -139,7 +171,8 @@ def transformar(registros: list[dict]) -> pd.DataFrame:
         "folio", "fecha", "duracion_min", "terminada", "estrato",
         "encuestador_id", "encuestador_nombre", "sexo_cuota", "rango_edad_cuota",
         "tiene_grabacion", "grabacion_duracion_seg", "grabacion_url",
-        "punto_asignado", "distancia_punto_m",
+        "punto_asignado", "distancia_punto_m", "version_cuestionario",
+        "seccion_declarada", "fuente_seccion",
     ]
     if not registros:
         return pd.DataFrame(columns=columnas_base)
@@ -181,21 +214,43 @@ def transformar(registros: list[dict]) -> pd.DataFrame:
     # quedó fuera. En MODO="test" el corte no aplica (ver config.py).
     if APLICAR_CORTE_FECHA:
         antes = len(df)
-        df = df[
+        dentro = (
             df["fecha"].notna()
             & (df["fecha"] >= _FECHA_INICIO)
             & (~df["fecha"].isin(_FECHAS_FUERA))
-        ].copy()
+        )
+        # Corte por hora de arranque: fecha_creacion ya está en hora local de
+        # México, así que la hora se compara directamente.
+        if HORA_INICIO_JORNADA is not None:
+            dentro &= (df["fecha_creacion"].dt.hour >= HORA_INICIO_JORNADA)
+
+        df = df[dentro].copy()
         if antes != len(df):
             logger.info("Corte de operativo: %d de %d registros descartados "
-                        "(previos al %s o en fechas excluidas).",
-                        antes - len(df), antes, INICIO_OPERATIVO)
+                        "(previos al %s, en fechas excluidas, o antes de las "
+                        "%s:00).", antes - len(df), antes, INICIO_OPERATIVO,
+                        HORA_INICIO_JORNADA)
 
     if df.empty:
         return pd.DataFrame(columns=columnas_base)
 
     # ── Folio ─────────────────────────────────────────────────────────────────
     df["folio"] = df["id_unico"].astype(str)
+
+    # ── Registros excluidos ───────────────────────────────────────────────────
+    # Descartes individuales autorizados (ver registros_excluidos.csv): capturas
+    # previas al arranque de la jornada, pruebas, registros invalidados en
+    # auditoría. Se filtran aquí, después de asignar folio y antes de cualquier
+    # cálculo, para que no entren a ningún KPI ni flag.
+    if REGISTROS_EXCLUIDOS:
+        fuera = df["folio"].isin(REGISTROS_EXCLUIDOS)
+        if fuera.any():
+            logger.info("Registros excluidos por autorización: %d (%s).",
+                        int(fuera.sum()),
+                        ", ".join(sorted(df.loc[fuera, "folio"])[:5]))
+            df = df[~fuera].copy()
+            if df.empty:
+                return pd.DataFrame(columns=columnas_base)
 
     # ── Sección electoral ─────────────────────────────────────────────────────
     # Llega como string, puede traer cero a la izquierda. La sección 160 está
@@ -204,6 +259,32 @@ def transformar(registros: list[dict]) -> pd.DataFrame:
     df["seccion_electoral"] = (
         pd.to_numeric(df["seccion_electoral"], errors="coerce").astype("Int64")
     )
+
+    # ── Corrección de sección (incidente del día 1) ───────────────────────────
+    # El 9 de octubre el catálogo del formulario estaba incompleto y la
+    # instrucción fue declarar una sección sustituta. Las correcciones se
+    # resolvieron una por una (GPS, manzana de muestra y documentación de
+    # coordinación) y viven en correcciones_seccion_dia1.csv.
+    #
+    # Se conserva lo capturado en `seccion_declarada` y se sobrescribe
+    # `seccion_electoral` con la corregida: así KPIs, flags y dashboard siguen
+    # consumiendo "la sección de la encuesta" sin cambiar, y el dato original
+    # queda disponible para auditoría.
+    df["seccion_declarada"] = df["seccion_electoral"]
+    df["fuente_seccion"] = "declarada"
+
+    if CORRECCIONES_SECCION:
+        corregidas = df["folio"].map(
+            lambda f: CORRECCIONES_SECCION.get(f, (None, None))[0])
+        fuentes = df["folio"].map(
+            lambda f: CORRECCIONES_SECCION.get(f, (None, None))[1])
+        hay = corregidas.notna()
+        if hay.any():
+            df.loc[hay, "seccion_electoral"] = (
+                pd.to_numeric(corregidas[hay], errors="coerce").astype("Int64"))
+            df.loc[hay, "fuente_seccion"] = fuentes[hay]
+            logger.info("Secciones corregidas: %d de %d registros.",
+                        int(hay.sum()), len(df))
 
     # ── Coordenadas ───────────────────────────────────────────────────────────
     # google_address.lat/lng ya son float y son la fuente primaria.
@@ -224,6 +305,12 @@ def transformar(registros: list[dict]) -> pd.DataFrame:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
     df["edad"] = pd.to_numeric(df["edad"], errors="coerce").astype("Int64")
+
+    # Desfragmentar antes de añadir las ~15 columnas derivadas que siguen. El
+    # bucle de arriba reasigna las 137 columnas de código una por una, lo que
+    # fragmenta el DataFrame; sin este copy(), cada columna nueva dispara un
+    # PerformanceWarning de pandas y llena los logs de Streamlit Cloud.
+    df = df.copy()
 
     # ── Buckets de cuota ──────────────────────────────────────────────────────
     # El bucket SIEMPRE sale de 'edad' numérica. 'rango_edad' (B_98_texto) casi
@@ -261,14 +348,59 @@ def transformar(registros: list[dict]) -> pd.DataFrame:
         df["grabacion_url"] = None
     df["tiene_grabacion"] = df["grabacion_url"].notna() & (df["grabacion_url"] != "None")
 
+    # ── Versión del cuestionario ──────────────────────────────────────────────
+    # El orden de pantallas cambió el 10 de octubre: P19_1 pasó de la 15 a la 8
+    # y P16 quedó como última sustantiva. Se marca la versión para que el
+    # análisis pueda separar ambas mediciones de P19_1, que no son comparables
+    # (en v1 se preguntaba después de las baterías de atributos, en v2 antes).
+    df["version_cuestionario"] = "v1"
+    for etiqueta, info in VERSIONES_CUESTIONARIO.items():
+        desde = pd.Timestamp(info["desde"]).date()
+        hasta = pd.Timestamp(info["hasta"]).date() if info["hasta"] else None
+        dentro = df["fecha"].notna() & (df["fecha"] >= desde)
+        if hasta is not None:
+            dentro &= df["fecha"] <= hasta
+        df.loc[dentro, "version_cuestionario"] = etiqueta
+
     # ── Terminada ─────────────────────────────────────────────────────────────
     # Bubble no expone estatus. Ver CRITERIO_TERMINADA en config.py.
-    if CRITERIO_TERMINADA == "pregunta_final":
-        # P19_1 es la última pregunta sustantiva (pantalla 15 de 17).
-        llegó_al_final = df["preferencia_total_morena"].notna() & (
+    if CRITERIO_TERMINADA == "por_version":
+        # Cada registro se evalúa con la última pregunta de SU versión del
+        # cuestionario: la v1 (9 oct) terminaba en P19_1, la v2 en P16. Medir
+        # ambas con la misma regla contaría mal una de las dos.
+        df["terminada"] = False
+        for etiqueta, info in VERSIONES_CUESTIONARIO.items():
+            de_esta_version = df["version_cuestionario"] == etiqueta
+            if not de_esta_version.any():
+                continue
+            df.loc[de_esta_version, "terminada"] = _llego_al_final(
+                df.loc[de_esta_version], info["ultima_pregunta"]
+            )
+
+    elif CRITERIO_TERMINADA == "p16":
+        # P16 (votaría / nunca votaría) es la última pregunta sustantiva desde
+        # la v2 del cuestionario, y se pregunta a TODOS sin filtro.
+        #
+        # Cuentan también los códigos 98/99: un "No sabe" ahí significa que el
+        # entrevistado SÍ recorrió la pantalla, que es lo que mide completitud.
+        # Por eso se usa notna() sobre la columna cruda y NO se filtran los
+        # códigos de no-respuesta, al contrario del resto del sistema.
+        cols_p16 = [f"codigo_votar_o_no_{cand}" for cand in CANDIDATOS
+                    if f"codigo_votar_o_no_{cand}" in df.columns]
+        if cols_p16:
+            df["terminada"] = df[cols_p16].notna().any(axis=1)
+        else:
+            logger.warning("No hay columnas de P16 en el DataFrame — "
+                           "'terminada' queda en False para todos.")
+            df["terminada"] = False
+
+    elif CRITERIO_TERMINADA == "pregunta_final":
+        # Criterio de la v1: llegó a P19_1 (entonces en la pantalla 15).
+        # ⚠️ Inválido desde la v2: P19_1 está en la pantalla 8, así que una
+        #    encuesta abandonada a media aplicación lo cumpliría.
+        df["terminada"] = df["preferencia_total_morena"].notna() & (
             df["preferencia_total_morena"].astype(str).str.strip() != ""
         )
-        df["terminada"] = llegó_al_final
     else:
         df["terminada"] = df["duracion_min"].fillna(0) >= DUR_MIN_TERMINADA
 

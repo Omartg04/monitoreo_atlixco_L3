@@ -35,7 +35,7 @@ from config import (
     GEOJSON_SECCIONES, ATLIXCO_CENTRO, ATLIXCO_ZOOM,
     PUNTOS_MUESTRA, PUNTOS_POR_SECCION, DIST_MANZANA_REFERENCIA_M,
     CANDIDATOS, CANDIDATO_FOCO,
-    ETIQUETAS_RANGO_EDAD,
+    ETIQUETAS_RANGO_EDAD, GRABACION_DURACION_MIN_SEG,
     ROLES, MODO, INICIO_OPERATIVO, CRITERIO_TERMINADA, META_ENCUESTAS_DIARIAS,
     MAPAS_CAMPO,
 )
@@ -526,21 +526,94 @@ with tab0:
     st.markdown('<div class="sec-title">Secciones de mi recorrido</div>',
                 unsafe_allow_html=True)
 
+    # ── Estado de cobertura por sección ───────────────────────────────────────
+    # Este tab era estático; ahora consulta el avance para poder esconder lo ya
+    # cubierto. Se usa df_raw (no el df filtrado por el sidebar): el estado de
+    # una sección no debe depender de qué fecha o encuestador esté filtrando el
+    # usuario en ese momento.
+    #
+    # ⚠️  Si Bubble no responde, NO se esconde nada: dejar fuera del mapa una
+    #     sección por un fallo de conexión haría que el coordinador no la
+    #     visite. Sin datos, todas se muestran y se avisa.
+    hay_datos = not df_raw.empty
+    estado_seccion: dict[int, str] = {s: "sin_iniciar" for s in METAS_POR_SECCION}
+    avance_seccion: dict[int, int] = {s: 0 for s in METAS_POR_SECCION}
+
+    if hay_datos:
+        _av = kpis.avance_por_seccion(df_raw).set_index("seccion")
+        for s in METAS_POR_SECCION:
+            if s in _av.index:
+                a = int(_av.loc[s, "avance"])
+                avance_seccion[s] = a
+                meta_s = METAS_POR_SECCION[s]["meta_encuestas"]
+                estado_seccion[s] = ("completa" if a >= meta_s
+                                     else "parcial" if a > 0 else "sin_iniciar")
+
+    n_completas = sum(1 for e in estado_seccion.values() if e == "completa")
+    n_parciales = sum(1 for e in estado_seccion.values() if e == "parcial")
+    n_nuevas = sum(1 for e in estado_seccion.values() if e == "sin_iniciar")
+
+    if not hay_datos:
+        st.warning(
+            "Sin conexión a los datos de avance: se muestran las 45 secciones. "
+            "El filtro de cobertura queda desactivado para no esconder "
+            "secciones por un fallo de conexión.")
+        ocultar_completas = ocultar_parciales = False
+    else:
+        o1, o2, o3 = st.columns([2, 2, 3])
+        with o1:
+            ocultar_completas = st.checkbox(
+                f"Ocultar secciones completas ({n_completas})",
+                value=n_completas > 0, key="ocultar_completas",
+                help="Secciones que ya alcanzaron su meta de entrevistas.")
+        with o2:
+            ocultar_parciales = st.checkbox(
+                f"Ocultar secciones parciales ({n_parciales})",
+                value=False, key="ocultar_parciales",
+                help="Secciones empezadas pero sin alcanzar meta. Apagado por "
+                     "defecto: esconderlas haría que nadie vuelva a cerrarlas.")
+        with o3:
+            st.caption(
+                f"🟢 {n_completas} completas · 🟡 {n_parciales} parciales · "
+                f"⚪ {n_nuevas} sin iniciar")
+
+    def _disponible(s: int) -> bool:
+        e = estado_seccion[s]
+        if ocultar_completas and e == "completa":
+            return False
+        if ocultar_parciales and e == "parcial":
+            return False
+        return True
+
+    opciones_secciones = [s for s in sorted(METAS_POR_SECCION) if _disponible(s)]
+
+    _marca = {"completa": "🟢", "parcial": "🟡", "sin_iniciar": "⚪"}
+
     secciones_recorrido = st.multiselect(
         "Selecciona las secciones que vas a cubrir — vacío muestra todas",
-        sorted(METAS_POR_SECCION.keys()),
+        opciones_secciones,
         default=[],
-        format_func=lambda s: (f"{s} · {METAS_POR_SECCION[s]['estrato']} · "
-                               f"{METAS_POR_SECCION[s]['manzanas']} mz · "
-                               f"meta {METAS_POR_SECCION[s]['meta_encuestas']}"),
+        format_func=lambda s: (
+            f"{_marca[estado_seccion[s]]} {s} · {METAS_POR_SECCION[s]['estrato']} · "
+            f"{METAS_POR_SECCION[s]['manzanas']} mz · "
+            f"{avance_seccion[s]}/{METAS_POR_SECCION[s]['meta_encuestas']}"),
         key="secciones_recorrido",
     )
 
     # Vacío = todas. `hay_seleccion` distingue "ver el operativo completo" de
     # "enfocar mi recorrido", que cambia el zoom y el mensaje compartible.
     hay_seleccion = bool(secciones_recorrido)
-    secciones_foco = sorted(secciones_recorrido) if hay_seleccion \
-        else sorted(METAS_POR_SECCION.keys())
+    # Sin selección explícita, el foco son las secciones que el filtro de
+    # cobertura deja disponibles — así "ocultar completas" también limpia el
+    # mapa y el mensaje, no solo la lista del multiselect.
+    secciones_foco = (sorted(secciones_recorrido) if hay_seleccion
+                      else sorted(opciones_secciones))
+
+    # `hay_enfoque` es lo que el MAPA debe mirar: hay enfoque tanto si el
+    # usuario seleccionó secciones como si el filtro de cobertura dejó fuera
+    # alguna. Mirar solo `hay_seleccion` hacía que el mapa pintara las 45
+    # aunque los interruptores de ocultar estuvieran encendidos.
+    hay_enfoque = len(secciones_foco) < len(METAS_POR_SECCION)
 
     if hay_seleccion:
         meta_foco = sum(METAS_POR_SECCION[s]["meta_encuestas"] for s in secciones_foco)
@@ -566,16 +639,26 @@ with tab0:
             en_foco = sec in secciones_foco
             if info is None:
                 feature["properties"].update(
-                    {"estrato": "—", "meta": 0, "manzanas": 0,
+                    {"estrato": "—", "meta": 0, "manzanas": 0, "avance": "—",
                      "estado": "Fuera de muestra"})
             else:
+                # El tooltip muestra el ESTADO DE COBERTURA, no si la sección
+                # está en el recorrido: el coordinador pasa el cursor para
+                # saber si vale la pena ir, y "En muestra" no responde eso.
+                _e = estado_seccion.get(sec, "sin_iniciar")
+                _etq = {"completa": "🟢 Completa",
+                        "parcial": "🟡 Parcial",
+                        "sin_iniciar": "⚪ Sin iniciar"}[_e]
+                if hay_enfoque and en_foco:
+                    _etq += " · en mi recorrido"
                 feature["properties"].update(
                     {"estrato": info["estrato"], "meta": info["meta_encuestas"],
                      "manzanas": info["manzanas"],
-                     "estado": "En mi recorrido" if (hay_seleccion and en_foco)
-                               else "En muestra"})
+                     "avance": (f"{avance_seccion.get(sec, 0)} de "
+                                f"{info['meta_encuestas']}"),
+                     "estado": _etq})
             # Bounds acumulados de las secciones enfocadas, para el fit_bounds
-            if hay_seleccion and en_foco:
+            if hay_enfoque and en_foco:
                 b = bounds_de_geometria(feature["geometry"])
                 if b:
                     bounds_foco = b if bounds_foco is None else [
@@ -595,7 +678,7 @@ with tab0:
                 base = {"fillColor": ESTRATO_COLORES.get(props["estrato"], AZUL_L),
                         "color": "#333", "weight": 1.2, "fillOpacity": 0.5}
 
-            if not hay_seleccion:
+            if not hay_enfoque:
                 return base
 
             if sec in secciones_foco:
@@ -621,8 +704,9 @@ with tab0:
             geo_plan, style_function=estilo_plan,
             highlight_function=lambda f: {"fillOpacity": 0.85, "weight": 3},
             tooltip=folium.GeoJsonTooltip(
-                fields=["seccion", "estrato", "estado", "manzanas", "meta"],
-                aliases=["Sección:", "Estrato:", "Estado:", "Manzanas:", "Meta:"],
+                fields=["seccion", "estrato", "estado", "avance", "manzanas"],
+                aliases=["Sección:", "Estrato:", "Estado:", "Avance:",
+                         "Manzanas:"],
                 localize=True, sticky=True,
                 style=("background-color:white;border:1px solid #2E7D5E;"
                        "border-radius:6px;padding:8px 12px;"
@@ -635,15 +719,15 @@ with tab0:
         # grande; el resto queda como capa apagable para no competir.
         puntos_foco = [p for p in PUNTOS_MUESTRA if p["seccion"] in secciones_foco]
         puntos_resto = ([p for p in PUNTOS_MUESTRA if p["seccion"] not in secciones_foco]
-                        if hay_seleccion else [])
+                        if hay_enfoque else [])
 
         capa_foco = folium.FeatureGroup(
-            name="Manzanas de mi recorrido" if hay_seleccion
+            name="Manzanas de mi recorrido" if hay_enfoque
             else "Manzanas seleccionadas", show=True)
         for p in puntos_foco:
             folium.CircleMarker(
                 location=[p["latitud"], p["longitud"]],
-                radius=6 if hay_seleccion else 4,
+                radius=6 if hay_enfoque else 4,
                 color="#FFFFFF", weight=1.4,
                 fill=True, fill_color=ESTRATO_COLORES.get(p["estrato"], AZUL),
                 fill_opacity=0.95,
@@ -675,7 +759,7 @@ with tab0:
         st_folium(mapa_plan, use_container_width=True, height=620,
                   returned_objects=[], key="mapa_planeacion")
 
-        if hay_seleccion:
+        if hay_enfoque:
             st.caption(
                 "Mapa enfocado a tu recorrido · las secciones vecinas quedan "
                 "atenuadas para dar referencia sin competir · ⛶ arriba a la "
@@ -1002,6 +1086,87 @@ with tab1:
             "llevaría a campo a perseguir un número que nadie validó. Sirve "
             "igual para detectar desequilibrios — si una celda se queda muy "
             "atrás frente a las demás, se corrige mientras aún se puede.")
+
+        # ── Grabaciones de audio ──────────────────────────────────────────────
+        st.markdown('<div class="sec-title">Grabaciones de audio (P19.1)</div>',
+                    unsafe_allow_html=True)
+
+        grab = kpis.resumen_grabaciones(df)
+
+        r1, r2, r3, r4 = st.columns(4)
+        kpi(r1, f"{grab['pct_cobertura']}%", "Cobertura de audio",
+            f"{grab['con_audio']:,} de {grab['terminadas']:,} terminadas",
+            "" if grab["pct_cobertura"] >= 90
+            else ("amarillo" if grab["pct_cobertura"] >= 70 else "rojo"))
+        kpi(r2, f"{grab['sin_audio']:,}", "Terminadas sin audio",
+            "revisar permisos de micrófono",
+            "rojo" if grab["sin_audio"] else "")
+        kpi(r3, f"{grab['duracion_mediana_seg']:.0f}s", "Duración mediana",
+            f"{grab['minutos_totales']:,.0f} min acumulados", "azul")
+        kpi(r4, f"{grab['audio_corto']:,}", "Audios cortos",
+            f"menos de {GRABACION_DURACION_MIN_SEG}s",
+            "amarillo" if grab["audio_corto"] else "")
+
+        if grab["audio_sin_terminar"]:
+            st.info(
+                f"**{grab['audio_sin_terminar']:,} registros tienen audio pero no "
+                f"están terminados.** Desde la versión 2 del cuestionario P19.1 "
+                f"está en la pantalla 8 de 16, así que grabar ya no implica haber "
+                f"llegado al final: esta cifra mide abandono entre la pantalla 8 "
+                f"y la última.")
+
+        ga, gb = st.columns([3, 2])
+        with ga:
+            g_enc = kpis.grabaciones_por_encuestador(df)
+            if g_enc.empty:
+                st.info("Sin encuestas terminadas todavía.")
+            else:
+                tbl_g = g_enc.copy()
+                tbl_g.columns = ["Encuestador", "Terminadas", "Con audio",
+                                 "% audio", "Dur. mediana (s)", "Audios cortos"]
+                tabla(tbl_g,
+                      estilos=[(color_pct, ["% audio"])],
+                      formatos={"% audio": "{:.1f}%",
+                                "Dur. mediana (s)": "{:.0f}"},
+                      altura=min(80 + len(tbl_g) * 35, 320))
+                st.caption(
+                    "Una tasa baja concentrada en una sola persona suele ser un "
+                    "permiso de micrófono denegado en su dispositivo, no "
+                    "desempeño — conviene revisarlo con ella antes de tratarlo "
+                    "como incumplimiento.")
+        with gb:
+            pend = kpis.grabaciones_pendientes(df)
+            if pend.empty:
+                st.success("Todas las encuestas terminadas tienen audio válido.")
+            else:
+                st.markdown(f"**{len(pend):,} pendientes de revisar**")
+                tbl_p = pend[["folio", "encuestador_nombre", "seccion_electoral",
+                              "motivo"]].copy()
+                tbl_p.columns = ["Folio", "Encuestador", "Sección", "Motivo"]
+                tabla(tbl_p, altura=min(80 + len(tbl_p) * 35, 320))
+
+        with st.expander("Escuchar grabaciones"):
+            d_audio = df[df["tiene_grabacion"].fillna(False)]
+            if d_audio.empty:
+                st.info("Sin grabaciones disponibles.")
+            else:
+                tbl_a = d_audio[["folio", "fecha", "encuestador_nombre",
+                                 "seccion_electoral", "grabacion_duracion_seg",
+                                 "preferencia_total_morena",
+                                 "grabacion_url"]].copy()
+                tbl_a.columns = ["Folio", "Fecha", "Encuestador", "Sección",
+                                 "Duración (s)", "Respuesta", "Audio"]
+                st.dataframe(
+                    tbl_a.sort_values(["Fecha", "Encuestador"]),
+                    use_container_width=True, hide_index=True, height=400,
+                    column_config={
+                        "Audio": st.column_config.LinkColumn(
+                            "Audio", display_text="Escuchar 🔊")
+                    },
+                )
+                st.caption(
+                    "El audio permite verificar que la respuesta registrada en "
+                    "P19.1 corresponde a lo que dijo el entrevistado.")
 
         # ── Manzanas sin cobertura ────────────────────────────────────────────
         st.markdown('<div class="sec-title">Manzanas sin cobertura</div>',
