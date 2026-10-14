@@ -84,7 +84,13 @@ def normalizar_nombre(valor) -> str:
 
 
 # Typos de captura confirmados uno por uno con coordinación de campo.
-CORRECCIONES_NOMBRE: dict[str, str] = {}
+# Día 2: el mismo encuestador capturó su nombre de tres formas distintas,
+# lo que infló el conteo de encuestadores y hundió sus métricas por persona.
+CORRECCIONES_NOMBRE: dict[str, str] = {
+    "EDUARDO": "EDUARDO CERVERA CEREZO",
+    "EDUARDO CERVERA": "EDUARDO CERVERA CEREZO",
+    "EDUARDO CEREZO": "EDUARDO CERVERA CEREZO",
+}
 
 
 def bin_edad_cuota(edad) -> str | None:
@@ -173,6 +179,7 @@ def transformar(registros: list[dict]) -> pd.DataFrame:
         "tiene_grabacion", "grabacion_duracion_seg", "grabacion_url",
         "punto_asignado", "distancia_punto_m", "version_cuestionario",
         "seccion_declarada", "fuente_seccion",
+        "rescatable", "aprovechable",
     ]
     if not registros:
         return pd.DataFrame(columns=columnas_base)
@@ -403,6 +410,37 @@ def transformar(registros: list[dict]) -> pd.DataFrame:
         )
     else:
         df["terminada"] = df["duracion_min"].fillna(0) >= DUR_MIN_TERMINADA
+
+    # ── Rescatable y aprovechable ─────────────────────────────────────────────
+    # Una entrevista abandonada no es necesariamente pérdida. Si alcanzó a
+    # registrar perfil y la preferencia de P19.1, sirve para la pregunta
+    # principal aunque le falte el cierre.
+    #
+    # El perfil es requisito, no un nivel más: sin sexo ni rango de edad el
+    # caso no se puede ponderar, por sustanciosa que sea la respuesta.
+    #
+    # P19.1 se da por registrada con el texto capturado O con el audio: en la
+    # práctica viajan juntos, y exigir ambos descartaría casos válidos.
+    #
+    # 'terminada' NO cambia de significado. Mide lo que siempre midió —llegar
+    # a la última pregunta— y los flags de calidad siguen colgando de ella.
+    # 'aprovechable' es la que se compara contra la meta.
+    _perfil = df["sexo_cuota"].notna() & df["rango_edad_cuota"].notna()
+
+    _p19_texto = pd.Series(False, index=df.index)
+    for _col in ("preferencia_total_morena", "codigo_preferencia_total_morena"):
+        if _col in df.columns:
+            _vals = df[_col]
+            _p19_texto |= _vals.notna() & (
+                _vals.astype(str).str.strip().isin(["", "None", "nan", "<NA>"]) == False
+            )
+
+    _p19_audio = (df["tiene_grabacion"].fillna(False)
+                  if "tiene_grabacion" in df.columns
+                  else pd.Series(False, index=df.index))
+
+    df["rescatable"] = (~df["terminada"]) & _perfil & (_p19_texto | _p19_audio)
+    df["aprovechable"] = df["terminada"] | df["rescatable"]
 
     # ── Estrato (desde la muestra) ────────────────────────────────────────────
     _estrato = {sec: v["estrato"] for sec, v in METAS_POR_SECCION.items()}

@@ -957,34 +957,55 @@ with tab1:
             else (METAS_POR_SECCION[seccion_sel]["meta_encuestas"]
                   if seccion_sel != "Todas" else META_POR_ESTRATO[estrato_sel])
         )
+        # El avance se mide contra APROVECHABLES. Las dos cifras que lo componen
+        # se muestran siempre: una sección que cierra con muchas rescatadas
+        # adentro queda corta para el análisis por aspirante, y eso tiene que
+        # verse ahora, no al final del estudio.
         terminadas_vista = int(df["terminada"].sum())
-        pct_vista = round(100 * terminadas_vista / meta_vista, 1) if meta_vista else 0.0
+        rescatadas_vista = int(df["rescatable"].sum())
+        aprov_vista = terminadas_vista + rescatadas_vista
+        pct_vista = round(100 * aprov_vista / meta_vista, 1) if meta_vista else 0.0
+        pct_resc = (round(100 * rescatadas_vista / aprov_vista)
+                    if aprov_vista else 0)
 
         a1, a2, a3, a4 = st.columns(4)
         kpi(a1, f"{len(df):,}", "Encuestas levantadas",
-            f"{resumen['incompletas']:,} sin terminar")
-        kpi(a2, f"{terminadas_vista:,}", "Encuestas terminadas",
-            f"criterio: {CRITERIO_TERMINADA.replace('_', ' ')}", "azul")
+            f"{len(df) - aprov_vista:,} sin dato aprovechable")
+        kpi(a2, f"{aprov_vista:,}", "Encuestas aprovechables",
+            f"{terminadas_vista:,} completas + {rescatadas_vista:,} rescatadas",
+            "azul")
         kpi(a3, f"{meta_vista:,}", "Meta de la vista",
             f"meta global: {META_GLOBAL:,}", "naranja")
         kpi(a4, f"{pct_vista}%", "Avance vs meta",
-            f"faltan {max(meta_vista - terminadas_vista, 0):,}",
+            f"faltan {max(meta_vista - aprov_vista, 0):,}",
             "rojo" if pct_vista < 60 else ("amarillo" if pct_vista < 100 else ""))
 
-        duracion_prom = round(df["duracion_min"].mean(), 1) if len(df) else 0
+        if rescatadas_vista:
+            st.caption(
+                f"**{pct_resc}%** del avance de esta vista son parciales "
+                f"rescatadas: registraron perfil y la preferencia de P19.1, pero "
+                f"no llegaron al final. Sirven para la pregunta principal; la "
+                f"mayoría no trae las baterías de atributos por aspirante."
+            )
+
+        # Solo terminadas: las abandonadas duran poco por abandono, no por
+        # prisa, y mezclarlas hunde el promedio sin explicar nada.
+        _term = df[df["terminada"]] if len(df) else df
+        duracion_prom = round(_term["duracion_min"].mean(), 1) if len(_term) else 0
         st.caption(
-            f"Duración promedio de entrevista: **{duracion_prom}′** "
-            f"(rango esperado {DUR_MIN_MIN}–{DUR_MAX_MIN} min)")
+            f"Duración promedio de entrevista **terminada**: **{duracion_prom}′** "
+            f"(rango esperado {DUR_MIN_MIN}–{DUR_MAX_MIN} min · "
+            f"{len(_term):,} de {len(df):,} registros)")
 
         # ── Ritmo diario ──────────────────────────────────────────────────────
         diario = kpis.avance_diario(df)
         if len(diario) > 1:
             st.markdown('<div class="sec-title">Ritmo de levantamiento</div>',
                         unsafe_allow_html=True)
-            fig_d = px.bar(diario, x="dia", y="terminadas",
+            fig_d = px.bar(diario, x="dia", y="aprovechables",
                            color_discrete_sequence=[VERDE],
-                           title="Encuestas terminadas por día", height=260,
-                           labels={"dia": "", "terminadas": "Terminadas"})
+                           title="Encuestas aprovechables por día", height=260,
+                           labels={"dia": "", "aprovechables": "Aprovechables"})
             fig_d.add_scatter(x=diario["dia"], y=diario["acumulado"],
                               mode="lines+markers", name="Acumulado",
                               line=dict(color=AZUL_L, width=2), yaxis="y2")
@@ -1011,26 +1032,44 @@ with tab1:
             f"{int(av_sec['manzanas_sin_cobertura'].sum())} manzanas sin ninguna "
             f"encuesta todavía")
 
-        tbl_sec = av_sec[["seccion", "estrato", "meta", "avance", "pct", "faltan",
+        tbl_sec = av_sec[["seccion", "estrato", "meta", "avance", "completas",
+                          "rescatadas", "pct", "faltan",
                           "manzanas", "manzanas_cubiertas", "manzanas_sin_cobertura",
                           "semaforo"]].copy()
-        tbl_sec.columns = ["Sección", "Estrato", "Meta", "Avance", "% Avance",
+        tbl_sec.columns = ["Sección", "Estrato", "Meta", "Avance", "Completas",
+                           "Rescatadas", "% Avance",
                            "Faltan", "Manzanas", "Cubiertas", "Sin cobertura",
                            "Semáforo"]
         tabla(tbl_sec,
               estilos=[(color_pct, ["% Avance"]), (color_semaforo, ["Semáforo"])],
               formatos={"% Avance": "{:.1f}%"},
               altura=min(80 + len(tbl_sec) * 35, 520))
-        st.caption("🟢 ≥100% de meta · 🟡 60–99% · 🔴 <60%")
+        st.caption("🟢 ≥100% de meta · 🟡 60–99% · 🔴 <60%  ·  "
+                   "*Avance = Completas + Rescatadas*")
+
+        # Secciones que llegan a meta apoyadas en parciales: van a quedar
+        # cortas al desagregar por aspirante.
+        _dep = av_sec[(av_sec["avance"] >= 5) & (av_sec["pct_rescate"] >= 20)]
+        if len(_dep):
+            st.warning(
+                f"**{len(_dep)} sección(es) con 20% o más del avance sostenido "
+                f"por parciales rescatadas:** "
+                + " · ".join(f"{int(r.seccion)} ({r.pct_rescate:.0f}%)"
+                             for r in _dep.itertuples())
+                + ". Sirven para la pregunta principal, pero quedarán cortas "
+                  "para el análisis de atributos por aspirante."
+            )
 
         # ── Avance por estrato ────────────────────────────────────────────────
         if estrato_sel == "Todos" and seccion_sel == "Todas":
             st.markdown('<div class="sec-title">Avance por estrato</div>',
                         unsafe_allow_html=True)
             av_est = kpis.avance_por_estrato(df)
-            tbl_est = av_est[["estrato", "n_secciones", "meta", "avance", "pct",
+            tbl_est = av_est[["estrato", "n_secciones", "meta", "avance",
+                              "completas", "rescatadas", "pct",
                               "faltan", "semaforo"]].copy()
             tbl_est.columns = ["Estrato", "Secciones", "Meta", "Avance",
+                               "Completas", "Rescatadas",
                                "% Avance", "Faltan", "Semáforo"]
             tabla(tbl_est,
                   estilos=[(color_pct, ["% Avance"]),
@@ -1042,10 +1081,12 @@ with tab1:
                     unsafe_allow_html=True)
         av_enc = kpis.avance_por_encuestador(df)
         tbl_enc = av_enc[["encuestador_nombre", "levantadas", "terminadas",
+                          "rescatadas", "aprovechables",
                           "pct_completitud", "duracion_prom_min",
                           "duracion_mediana_min", "secciones_trabajadas",
                           "manzanas_trabajadas", "dias_activos"]].copy()
         tbl_enc.columns = ["Encuestador", "Levantadas", "Terminadas",
+                           "Rescatadas", "Aprovechables",
                            "% Completitud", "Dur. prom", "Dur. mediana",
                            "Secciones", "Manzanas", "Días activos"]
         tabla(tbl_enc,
@@ -1060,9 +1101,10 @@ with tab1:
             f"{META_ENCUESTAS_DIARIAS} encuestas.")
 
         with st.expander("📊 Distribución de duraciones", expanded=False):
-            fig_box = px.box(df, y="duracion_min", color_discrete_sequence=[VERDE],
+            fig_box = px.box(df[df["terminada"]], y="duracion_min",
+                             color_discrete_sequence=[VERDE],
                              labels={"duracion_min": "Minutos"},
-                             title="Duración de entrevistas")
+                             title="Duración de entrevistas terminadas")
             fig_box.add_hline(y=DUR_MAX_MIN, line_dash="dash", line_color=AMARILLO,
                               annotation_text=f"Máx ({DUR_MAX_MIN} min)")
             fig_box.add_hline(y=DUR_MIN_MIN, line_dash="dot", line_color=ROJO,
@@ -1599,3 +1641,4 @@ with tab3:
             st.caption(
                 "🔴 sin ningún avance habiendo avance en otras secciones · "
                 "🟡 por debajo de la mitad del promedio global.")
+

@@ -598,6 +598,42 @@ def resumen_cobertura_desbalanceada(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# AGREGADO · SECCIONES SOSTENIDAS POR PARCIALES RESCATADAS
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Una sección puede llegar a su meta de aprovechables con varias parciales
+# adentro. Para la pregunta principal cuentan igual, pero las rescatadas rara
+# vez traen las baterías de atributos: esa sección va a quedar corta cuando se
+# desagregue por aspirante, y no hay forma de notarlo mirando solo el avance.
+UMBRAL_RESCATE_AMARILLO = 20.0   # % del avance sostenido por rescatadas
+UMBRAL_RESCATE_ROJO = 35.0
+
+
+def resumen_dependencia_rescate(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Secciones cuyo avance depende demasiado de parciales rescatadas.
+
+    Se evalúa solo donde ya hay avance suficiente para que el porcentaje
+    signifique algo: con 3 encuestas, una rescatada da 33% y no dice nada.
+    """
+    import kpis
+
+    av = kpis.avance_por_seccion(df)
+    if av.empty or "pct_rescate" not in av.columns:
+        return av
+
+    medible = av["avance"] >= 5
+    rojo = medible & (av["pct_rescate"] >= UMBRAL_RESCATE_ROJO)
+    amarillo = medible & ~rojo & (av["pct_rescate"] >= UMBRAL_RESCATE_AMARILLO)
+
+    av["flag_rescate"] = rojo | amarillo
+    av["flag_rescate_nivel"] = None
+    av.loc[amarillo, "flag_rescate_nivel"] = "amarillo"
+    av.loc[rojo, "flag_rescate_nivel"] = "rojo"
+    return av
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # ORQUESTADOR
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -609,6 +645,7 @@ def aplicar_todos_los_flags(df: pd.DataFrame) -> pd.DataFrame:
         flag_racha_rapida(df)
         flag_sesgo_encuestador(df)
         resumen_cobertura_desbalanceada(df)
+        resumen_dependencia_rescate(df)
     """
     if df.empty:
         return df

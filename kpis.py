@@ -45,19 +45,29 @@ def _semaforo(pct: float) -> str:
 
 def resumen_global(df: pd.DataFrame) -> dict:
     """
-    El avance se mide con encuestas TERMINADAS, no levantadas: una encuesta
-    abandonada a la mitad no cubre una unidad de la muestra.
+    El avance se mide con encuestas APROVECHABLES: terminadas más las parciales
+    que alcanzaron a registrar perfil y la preferencia de P19.1.
+
+    'terminadas' se sigue reportando aparte y NO se diluye en la suma. Las dos
+    cifras tienen que viajar juntas: una sección que cierra con varias
+    rescatadas adentro tiene menos casos para el análisis de atributos, y eso
+    debe verse mientras todavía se puede mandar gente, no al final del estudio.
     """
     terminadas = int(df["terminada"].sum()) if not df.empty else 0
+    rescatadas = int(df["rescatable"].sum()) if not df.empty else 0
+    aprovechables = terminadas + rescatadas
     levantadas = len(df)
 
     return {
         "meta_global": META_GLOBAL,
         "levantadas": levantadas,
         "terminadas": terminadas,
-        "incompletas": levantadas - terminadas,
-        "avance_pct": round(100 * terminadas / META_GLOBAL, 1) if META_GLOBAL else 0.0,
-        "faltan": max(META_GLOBAL - terminadas, 0),
+        "rescatadas": rescatadas,
+        "aprovechables": aprovechables,
+        "incompletas": levantadas - aprovechables,
+        "pct_rescate": round(100 * rescatadas / aprovechables, 1) if aprovechables else 0.0,
+        "avance_pct": round(100 * aprovechables / META_GLOBAL, 1) if META_GLOBAL else 0.0,
+        "faltan": max(META_GLOBAL - aprovechables, 0),
         "secciones_en_meta": int(avance_por_seccion(df)["cubierta"].sum()),
         "secciones_totales": len(METAS_POR_SECCION),
     }
@@ -74,19 +84,23 @@ def avance_por_seccion(df: pd.DataFrame) -> pd.DataFrame:
     que es justo lo que hay que ver.
     """
     if df.empty:
-        terminadas = pd.Series(dtype=int)
+        aprov = pd.Series(dtype=int)
+        completas = pd.Series(dtype=int)
         manzanas_cub = pd.Series(dtype=int)
     else:
-        d_term = df[df["terminada"]]
-        terminadas = d_term.groupby("seccion_electoral").size()
+        d_aprov = df[df["aprovechable"]]
+        aprov = d_aprov.groupby("seccion_electoral").size()
+        completas = df[df["terminada"]].groupby("seccion_electoral").size()
         manzanas_cub = (
-            d_term[d_term["punto_asignado"].notna()]
+            d_aprov[d_aprov["punto_asignado"].notna()]
             .groupby("seccion_electoral")["punto_asignado"].nunique()
         )
 
     filas = []
     for seccion, info in METAS_POR_SECCION.items():
-        avance = int(terminadas.get(seccion, 0))
+        avance = int(aprov.get(seccion, 0))
+        n_completas = int(completas.get(seccion, 0))
+        n_rescatadas = avance - n_completas
         meta = info["meta_encuestas"]
         pct = round(100 * avance / meta, 1) if meta else 0.0
         n_manzanas = info["manzanas"]
@@ -99,6 +113,11 @@ def avance_por_seccion(df: pd.DataFrame) -> pd.DataFrame:
             "manzanas_sin_cobertura": max(n_manzanas - cubiertas, 0),
             "meta": meta,
             "avance": avance,
+            "completas": n_completas,
+            "rescatadas": n_rescatadas,
+            # Peso de las rescatadas en el avance: avisa qué secciones van a
+            # quedar cortas para el análisis desagregado de atributos.
+            "pct_rescate": round(100 * n_rescatadas / avance, 1) if avance else 0.0,
             "pct": pct,
             "faltan": max(meta - avance, 0),
             "cubierta": avance >= meta,
@@ -125,12 +144,16 @@ def avance_por_estrato(df: pd.DataFrame) -> pd.DataFrame:
     for estrato, secciones in SECCIONES_POR_ESTRATO.items():
         meta = META_POR_ESTRATO[estrato]
         avance = int(av.loc[secciones, "avance"].sum())
+        n_completas = int(av.loc[secciones, "completas"].sum())
+        n_rescatadas = avance - n_completas
         pct = round(100 * avance / meta, 1) if meta else 0.0
         filas.append({
             "estrato": estrato,
             "n_secciones": len(secciones),
             "meta": meta,
             "avance": avance,
+            "completas": n_completas,
+            "rescatadas": n_rescatadas,
             "pct": pct,
             "faltan": max(meta - avance, 0),
             "semaforo": _semaforo(pct),
@@ -151,7 +174,8 @@ def avance_por_encuestador(df: pd.DataFrame,
     mucho y termina poco — patrón distinto al de quien simplemente va lento.
     """
     cols = ["encuestador_id", "encuestador_nombre", "levantadas", "terminadas",
-            "pct_completitud", "duracion_prom_min", "duracion_mediana_min",
+            "rescatadas", "aprovechables", "pct_completitud",
+            "duracion_prom_min", "duracion_mediana_min",
             "secciones_trabajadas", "manzanas_trabajadas", "dias_activos"]
     if df.empty:
         return pd.DataFrame(columns=cols)
@@ -163,44 +187,65 @@ def avance_por_encuestador(df: pd.DataFrame,
     d = d.copy()
     d["_dia"] = pd.to_datetime(d["fecha_creacion"], errors="coerce").dt.date
 
-    g = d.groupby(["encuestador_id", "encuestador_nombre"], dropna=False)
+    llaves = ["encuestador_id", "encuestador_nombre"]
+    g = d.groupby(llaves, dropna=False)
     out = g.agg(
         levantadas=("folio", "count"),
         terminadas=("terminada", "sum"),
-        duracion_prom_min=("duracion_min", "mean"),
-        duracion_mediana_min=("duracion_min", "median"),
+        rescatadas=("rescatable", "sum"),
         secciones_trabajadas=("seccion_electoral", "nunique"),
         manzanas_trabajadas=("punto_asignado", "nunique"),
         dias_activos=("_dia", "nunique"),
     ).reset_index()
 
+    # La duración se mide SOLO sobre terminadas. Una encuesta abandonada en la
+    # pantalla 3 dura dos minutos y no dice nada sobre el ritmo de entrevista:
+    # mezclarlas hunde el promedio y hace ver como "prisa" lo que es abandono.
+    dur = (d[d["terminada"]].groupby(llaves, dropna=False)
+           .agg(duracion_prom_min=("duracion_min", "mean"),
+                duracion_mediana_min=("duracion_min", "median"))
+           .reset_index())
+    out = out.merge(dur, on=llaves, how="left")
+
     out["terminadas"] = out["terminadas"].astype(int)
+    out["rescatadas"] = out["rescatadas"].astype(int)
+    out["aprovechables"] = out["terminadas"] + out["rescatadas"]
+    # La completitud se mide contra TERMINADAS, no aprovechables: mide si la
+    # entrevista se concluyó, que es cosa distinta de si el dato sirve.
     out["pct_completitud"] = (
         100 * out["terminadas"] / out["levantadas"].clip(lower=1)
     ).round(1)
     out["duracion_prom_min"] = out["duracion_prom_min"].round(1)
     out["duracion_mediana_min"] = out["duracion_mediana_min"].round(1)
 
-    return out[cols].sort_values("terminadas", ascending=False).reset_index(drop=True)
+    return out[cols].sort_values("aprovechables", ascending=False).reset_index(drop=True)
 
 
 def avance_diario(df: pd.DataFrame) -> pd.DataFrame:
-    """Terminadas por día y acumulado — para ver el ritmo contra la meta."""
+    """
+    Aprovechables por día y acumulado — el ritmo real contra la meta.
+    Se reportan también las terminadas para ver cuánto del avance diario
+    viene de entrevistas completas y cuánto de parciales rescatadas.
+    """
+    cols = ["dia", "levantadas", "terminadas", "rescatadas", "aprovechables",
+            "acumulado", "pct_meta_acumulado"]
     if df.empty:
-        return pd.DataFrame(columns=["dia", "levantadas", "terminadas",
-                                     "acumulado", "pct_meta_acumulado"])
+        return pd.DataFrame(columns=cols)
     d = df.copy()
     d["dia"] = pd.to_datetime(d["fecha_creacion"], errors="coerce").dt.date
 
     out = d.groupby("dia").agg(
         levantadas=("folio", "count"),
         terminadas=("terminada", "sum"),
+        rescatadas=("rescatable", "sum"),
     ).reset_index().sort_values("dia")
 
     out["terminadas"] = out["terminadas"].astype(int)
-    out["acumulado"] = out["terminadas"].cumsum()
+    out["rescatadas"] = out["rescatadas"].astype(int)
+    out["aprovechables"] = out["terminadas"] + out["rescatadas"]
+    out["acumulado"] = out["aprovechables"].cumsum()
     out["pct_meta_acumulado"] = (100 * out["acumulado"] / META_GLOBAL).round(1)
-    return out.reset_index(drop=True)
+    return out[cols].reset_index(drop=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -208,10 +253,10 @@ def avance_diario(df: pd.DataFrame) -> pd.DataFrame:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _conteo_cuotas(d: pd.DataFrame) -> pd.Series:
-    """Conteo por celda (rango_edad, sexo) entre encuestas terminadas."""
+    """Conteo por celda (rango_edad, sexo) entre encuestas aprovechables."""
     if d.empty:
         return pd.Series(dtype=int)
-    t = d[d["terminada"]]
+    t = d[d["aprovechable"]]
     if t.empty:
         return pd.Series(dtype=int)
     return t.groupby(["rango_edad_cuota", "sexo_cuota"]).size()
@@ -297,7 +342,7 @@ def composicion_lograda(df: pd.DataFrame,
     # Registros terminados sin sexo o sin edad válida: no entran a ninguna
     # celda, así que hay que reportarlos aparte o el total no cuadra.
     if not d.empty:
-        t = d[d["terminada"]]
+        t = d[d["aprovechable"]]
         sin_clasificar = int(
             (t["sexo_cuota"].isna() | t["rango_edad_cuota"].isna()).sum()
         )
@@ -360,7 +405,7 @@ def cobertura_manzanas(df: pd.DataFrame,
     if df.empty:
         conteo = pd.Series(dtype=int)
     else:
-        t = df[df["terminada"] & df["punto_asignado"].notna()]
+        t = df[df["aprovechable"] & df["punto_asignado"].notna()]
         conteo = t.groupby("punto_asignado").size()
 
     filas = []
@@ -388,7 +433,7 @@ def cobertura_manzanas(df: pd.DataFrame,
 
 
 def manzanas_sin_cobertura(df: pd.DataFrame) -> pd.DataFrame:
-    """Solo las manzanas de la muestra sin ninguna encuesta terminada."""
+    """Solo las manzanas de la muestra sin ninguna encuesta aprovechable."""
     cob = cobertura_manzanas(df)
     return cob[cob["avance"] == 0].reset_index(drop=True)
 
